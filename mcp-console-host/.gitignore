@@ -1,0 +1,5 @@
+# claves y configs locales
+.env
+__pycache__/
+.venv/
+venv/
