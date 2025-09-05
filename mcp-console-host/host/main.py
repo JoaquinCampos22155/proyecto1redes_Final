@@ -37,37 +37,25 @@ def extract_tool_uses(blocks: list[dict | object]) -> list[ToolCall]:
     return calls
 
 def _tool_names_from_adapter(adapter) -> list[str]:
-    # MCPAdapter expone .tools
     if hasattr(adapter, "tools") and isinstance(getattr(adapter, "tools"), list):
         return [t.get("name") for t in adapter.tools if isinstance(t, dict)]
     # Fallback (por si se ejecuta en DIRECT sin MCP)
     return ["add_song", "list_playlists", "get_playlist", "export_playlist", "clear_library"]
 
 def format_welcome(names: list[str]) -> str:
-    # Construye mensaje de ayuda con ejemplos de comandos "Run the tool ..."
     example_song = "C:\\\\ruta\\\\a\\\\cancion.mp3"
     example_csv  = "C:\\\\Users\\\\tuusuario\\\\setlist.csv"
     lines = ["Opciones MCP disponibles:"]
     if "add_song" in names:
-        lines.append(
-            f'• Añadir canción → Run the tool add_song with {{"path":"{example_song}"}}'
-        )
+        lines.append(f'• Añadir canción → Run the tool add_song with {{"path":"{example_song}"}}')
     if "list_playlists" in names:
-        lines.append(
-            '• Ver playlists → Run the tool list_playlists with {}'
-        )
+        lines.append('• Ver playlists → Run the tool list_playlists with {}')
     if "get_playlist" in names:
-        lines.append(
-            '• Ver una playlist → Run the tool get_playlist with {"name":"Pop 100–130"}'
-        )
+        lines.append('• Ver una playlist → Run the tool get_playlist with {"name":"Pop 100–130"}')
     if "export_playlist" in names:
-        lines.append(
-            f'• Exportar playlist → Run the tool export_playlist with {{"name":"Pop 100–130","csv_path":"{example_csv}"}}'
-        )
+        lines.append(f'• Exportar playlist → Run the tool export_playlist with {{"name":"Pop 100–130","csv_path":"{example_csv}"}}')
     if "clear_library" in names:
-        lines.append(
-            '• Limpiar librería → Run the tool clear_library with {}'
-        )
+        lines.append('• Limpiar librería → Run the tool clear_library with {}')
     lines.append("Tip: escribe help para volver a ver estas opciones.")
     return "\n".join(lines)
 
@@ -97,30 +85,27 @@ def run_chat_loop():
 
     client = Anthropic(api_key=api_key)
 
-    # --- Adapter selection
-    if mode == "mcp":
-        cmd = strip_quotes(os.environ.get("MCP_SERVER_CMD") or "")
-        args = env_list("MCP_SERVER_ARGS")  # coma-separado, p.ej. "-m,setlist_architect.server"
-        cwd = norm_path(os.environ.get("MCP_CWD"))
-        extra_env = {}
-        if os.environ.get("MCP_PYTHONPATH"):
-            extra_env["PYTHONPATH"] = norm_path(os.environ["MCP_PYTHONPATH"]) or ""
-        adapter = MCPAdapter(cmd, args, cwd=cwd, env=extra_env)
-        console.print(
-            f"[cyan]MCP conectado. Tools detectadas: "
-            f"{[t.get('name') for t in getattr(adapter, 'tools', [])]}[/cyan]"
-        )
-    else:
-        console.print("[yellow]MODE=direct: el flujo per-song (add_song, playlists) requiere MODE=mcp.[/yellow]")
-        # En DIRECT no tenemos implementación equivalente a per-song.
-        cmd = strip_quotes(os.environ.get("MCP_SERVER_CMD") or "")
-        args = env_list("MCP_SERVER_ARGS")
-        cwd = norm_path(os.environ.get("MCP_CWD"))
-        adapter = MCPAdapter(cmd, args, cwd=cwd)  # intenta igualmente usar MCP
+    # --- Adapter (MCP) ---
+    cmd = strip_quotes(os.environ.get("MCP_SERVER_CMD") or "")
+    args = env_list("MCP_SERVER_ARGS")  # p.ej. "-m,setlist_architect.server"
+    cwd = norm_path(os.environ.get("MCP_CWD"))
+    extra_env = {}
+    if os.environ.get("MCP_PYTHONPATH"):
+        extra_env["PYTHONPATH"] = norm_path(os.environ["MCP_PYTHONPATH"]) or ""
+    timeout = float(os.environ.get("MCP_TIMEOUT_S", "180"))
+
+    if mode != "mcp":
+        console.print("[yellow]MODE=direct: el flujo per-song requiere MODE=mcp; forzando MCP[/yellow]")
+
+    adapter = MCPAdapter(cmd, args, cwd=cwd, env=extra_env, timeout_s=timeout)
+    console.print(
+        f"[cyan]MCP conectado. Tools detectadas: "
+        f"{[t.get('name') for t in getattr(adapter, 'tools', [])]}[/cyan]"
+    )
 
     history: list[dict[str, Any]] = []
 
-    # --- Mensaje inicial como "assistant" con los comandos MCP
+    # Mensaje inicial con ejemplos
     names = _tool_names_from_adapter(adapter)
     welcome = format_welcome(names)
     print(f"assistant> {welcome}")
@@ -143,13 +128,12 @@ def run_chat_loop():
                 model=model,
                 max_tokens=1024,
                 system=SYSTEM_PROMPT,
-                tools=TOOLS,  # <-- asegúrate de que definen las 5 tools nuevas
+                tools=TOOLS,
                 messages=history + [{"role": "user", "content": user}],
             )
 
             tool_calls = extract_tool_uses(msg.content)
             if tool_calls:
-                # Ejecuta cada tool y regresa sus resultados como tool_result
                 results_blocks: list[dict[str, Any]] = []
                 for tc in tool_calls:
                     try:
@@ -164,7 +148,7 @@ def run_chat_loop():
                         }
                     )
 
-                # 2ª ronda: el modelo integra los resultados y responde al usuario
+                # 2ª ronda: integra resultados de tools
                 follow = client.messages.create(
                     model=model,
                     max_tokens=1024,
@@ -194,7 +178,6 @@ def run_chat_loop():
                     ]
                 )
     finally:
-        # Cierra MCP si aplica
         try:
             if isinstance(adapter, MCPAdapter):
                 adapter.close()

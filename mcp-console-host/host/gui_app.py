@@ -3,20 +3,21 @@ from __future__ import annotations
 import os
 import json
 import traceback
-from typing import Any, List, Optional, Iterable, Set
+from typing import Any, List, Optional
 
 from dotenv import load_dotenv
 from anthropic import Anthropic
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit, QTextEdit,
-    QHBoxLayout, QVBoxLayout, QFileDialog, QComboBox, QSpinBox, QTableWidget,
-    QTableWidgetItem, QFrame, QMessageBox, QSplitter, QSizePolicy, QTableWidgetSelectionRange
+    QHBoxLayout, QVBoxLayout, QFileDialog, QTableWidget,
+    QTableWidgetItem, QFrame, QMessageBox, QSplitter, QSizePolicy
 )
 
-from .tool_schemas import TOOLS  # <- cuando actualices el schema del LLM, usa las nuevas tools aquí
+from .tool_schemas import TOOLS
+    # seguimos usando el mismo schema (add_song, list_playlists, ... ya expuesto)
 from .mcp_adapter import MCPAdapter
 from .utils import env_list, norm_path, strip_quotes
 
@@ -113,16 +114,16 @@ class ChatWorker(QThread):
             self.fail.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
-# ---------------- Drop Area para ARCHIVOS ----------------
+# ---------------- Drop Area para archivos (solo drop) ----------------
 class DropArea(QFrame):
-    filesDropped = Signal(list)  # lista de rutas absolutas
+    pathDropped = Signal(str)  # absoluta
 
     def __init__(self):
         super().__init__()
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Plain)
         self.setStyleSheet("QFrame { border: 2px dashed #888; border-radius: 8px; }")
         self.setAcceptDrops(True)
-        lbl = QLabel("Arrastra aquí tus canciones (MP3/WAV/FLAC/M4A/OGG)")
+        lbl = QLabel("Arrastra aquí una canción (MP3/WAV/FLAC/M4A/OGG)")
         lbl.setAlignment(Qt.AlignCenter)
         font = QFont()
         font.setPointSize(10)
@@ -138,25 +139,18 @@ class DropArea(QFrame):
         urls = event.mimeData().urls()
         if not urls:
             return
-        paths = []
-        for u in urls:
-            p = u.toLocalFile()
-            if p:
-                # si es carpeta, ignora (nuevo flujo: per-song)
-                if os.path.isfile(p):
-                    paths.append(p)
-        if paths:
-            self.filesDropped.emit(paths)
+        first = urls[0].toLocalFile()
+        if not first:
+            return
+        self.pathDropped.emit(first)
 
 
 # ---------------- Ventana principal ----------------
-SUPPORTED_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".ogg"}
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Setlist Architect — Chat + MCP")
-        self.resize(1200, 760)
+        self.resize(1100, 740)
 
         load_dotenv()
         self.api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -165,18 +159,21 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Falta API Key", "Define ANTHROPIC_API_KEY en tu .env")
         self.client = Anthropic(api_key=self.api_key) if self.api_key else None
 
-        # Conectar MCP al iniciar
+        # Conectar MCP al iniciar (timeout infinito si MCP_TIMEOUT_S no está)
         self.adapter: Optional[MCPAdapter] = None
         self._connect_mcp()
 
         # Historial de conversación
         self.history: list[dict[str, Any]] = []
-
-        # Canciones pendientes de agregar (paths)
-        self.pending_files: Set[str] = set()
+        self._last_user_text: str = ""
 
         # UI
         self._build_ui()
+        self.update_hints()
+
+        # Animación "pensando…"
+        self._thinking_timer: Optional[QTimer] = None
+        self._thinking_dots: int = 0
 
     # ---------- Conexión MCP ----------
     def _connect_mcp(self):
@@ -187,7 +184,10 @@ class MainWindow(QMainWindow):
             extra_env = {}
             if os.environ.get("MCP_PYTHONPATH"):
                 extra_env["PYTHONPATH"] = norm_path(os.environ["MCP_PYTHONPATH"]) or ""
-            self.adapter = MCPAdapter(cmd, args, cwd=cwd, env=extra_env)
+            # Si MCP_TIMEOUT_S no está → None = espera infinita
+            tval = os.environ.get("MCP_TIMEOUT_S")
+            timeout = float(tval) if tval not in (None, "",) else None
+            self.adapter = MCPAdapter(cmd, args, cwd=cwd, env=extra_env, timeout_s=timeout)
             tools = [t.get("name") for t in getattr(self.adapter, "tools", [])]
             self.mcp_status = f"Conectado (tools: {tools})"
         except Exception as e:
@@ -199,14 +199,9 @@ class MainWindow(QMainWindow):
         return p.replace("\\", "\\\\").strip()
 
     def _build_hints_text(self) -> str:
-        # usa un path de ejemplo o el último ingresado en el input
-        example = "C:\\\\ruta\\\\a\\\\cancion.mp3"
-        user_one = ""
-        if hasattr(self, "file_input"):
-            txt = self.file_input.text().strip()
-            if txt:
-                user_one = self._escape_path(txt)
-        song = user_one or example
+        # usa la última canción dropeada para prellenar
+        song = getattr(self, "_last_dropped_song", "") or "C:\\\\ruta\\\\a\\\\cancion.mp3"
+        song = self._escape_path(song)
         csv_path = self._escape_path(os.path.join(os.path.expanduser("~"), "setlist.csv"))
 
         lines = [
@@ -240,7 +235,7 @@ class MainWindow(QMainWindow):
 
         self.hints_text = QTextEdit()
         self.hints_text.setReadOnly(True)
-        self.hints_text.setMaximumHeight(140)
+        self.hints_text.setMaximumHeight(120)
 
         self.hints_refresh = QPushButton("Actualizar")
         self.hints_refresh.clicked.connect(self.update_hints)
@@ -261,13 +256,18 @@ class MainWindow(QMainWindow):
         self.chat_view.setReadOnly(True)
 
         self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Escribe tu mensaje… (o usa: Run the tool ...)")
+        self.input_edit.setPlaceholderText('Escribe tu mensaje… (ej: Run the tool add_song with {"path":"C:\\\\...\\\\file.mp3"})')
         self.send_btn = QPushButton("Enviar")
         self.send_btn.clicked.connect(self.on_send)
+
+        # Indicador de “pensando…”
+        self.thinking_label = QLabel("")
+        self.thinking_label.setStyleSheet("color: #777;")
 
         chat_box = QVBoxLayout()
         chat_box.addWidget(QLabel("Chat"))
         chat_box.addWidget(self.chat_view, stretch=1)
+        chat_box.addWidget(self.thinking_label)
 
         input_row = QHBoxLayout()
         input_row.addWidget(self.input_edit, stretch=1)
@@ -277,66 +277,16 @@ class MainWindow(QMainWindow):
         chat_panel = QWidget()
         chat_panel.setLayout(chat_box)
 
-        # -------- Panel Herramientas (per-song) --------
+        # -------- Panel Derecho minimalista --------
         tools_box = QVBoxLayout()
-        tools_box.addWidget(QLabel("Canciones a añadir (arrastra o examina)"))
+        tools_box.addWidget(QLabel("Arrastra una canción"))
 
-        # Input + Browse
-        self.file_input = QLineEdit()
-        self.file_input.setPlaceholderText("Pega la ruta de una canción (MP3/WAV/FLAC/M4A/OGG)")
-        browse_btn = QPushButton("Examinar…")
-        browse_btn.clicked.connect(self.on_browse_files)
-
-        input_row2 = QHBoxLayout()
-        input_row2.addWidget(self.file_input, stretch=1)
-        input_row2.addWidget(browse_btn)
-        tools_box.addLayout(input_row2)
-
-        # Drop area
         self.drop_area = DropArea()
-        self.drop_area.setMinimumHeight(90)
-        self.drop_area.filesDropped.connect(self.on_files_dropped)
+        self.drop_area.setMinimumHeight(110)
+        self.drop_area.pathDropped.connect(self.on_song_dropped)
         tools_box.addWidget(self.drop_area)
 
-        # Pending files status + Add button
-        self.pending_label = QLabel("0 archivos pendientes")
-        add_btn = QPushButton("➕ Añadir canción(es)")
-        add_btn.clicked.connect(self.on_add_songs)
-
-        row_add = QHBoxLayout()
-        row_add.addWidget(self.pending_label)
-        row_add.addStretch(1)
-        row_add.addWidget(add_btn)
-        tools_box.addLayout(row_add)
-
-        # Playlists panel
-        tools_box.addWidget(QLabel("Playlists"))
-        self.playlists_table = QTableWidget(0, 2)
-        self.playlists_table.setHorizontalHeaderLabels(["name", "count"])
-        self.playlists_table.horizontalHeader().setStretchLastSection(True)
-        self.playlists_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
-        tools_box.addWidget(self.playlists_table)
-
-        row_pl_buttons = QHBoxLayout()
-        refresh_pl = QPushButton("🔄 Refrescar playlists")
-        refresh_pl.clicked.connect(self.on_list_playlists)
-        self.playlist_name_edit = QLineEdit()
-        self.playlist_name_edit.setPlaceholderText('Nombre exacto (p.ej. "Pop 100–130")')
-        show_pl = QPushButton("👁️ Ver playlist")
-        show_pl.clicked.connect(self.on_get_playlist)
-        export_pl = QPushButton("💾 Exportar playlist…")
-        export_pl.clicked.connect(self.on_export_playlist)
-        clear_btn = QPushButton("🧹 Limpiar librería")
-        clear_btn.clicked.connect(self.on_clear_library)
-
-        row_pl_buttons.addWidget(refresh_pl)
-        row_pl_buttons.addWidget(self.playlist_name_edit, stretch=1)
-        row_pl_buttons.addWidget(show_pl)
-        row_pl_buttons.addWidget(export_pl)
-        row_pl_buttons.addWidget(clear_btn)
-        tools_box.addLayout(row_pl_buttons)
-
-        # Resultados (tracks en memoria / playlist mostrada)
+        # Resultados
         self.notes_label = QLabel("")
         self.results_table = QTableWidget(0, 9)
         self.results_table.setHorizontalHeaderLabels(
@@ -345,6 +295,8 @@ class MainWindow(QMainWindow):
         self.results_table.horizontalHeader().setStretchLastSection(True)
         self.results_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
+        tools_box.addWidget(QLabel("Notas / Métricas"))
+        tools_box.addWidget(self.notes_label)
         tools_box.addWidget(QLabel("Resultados"))
         tools_box.addWidget(self.results_table, stretch=1)
 
@@ -355,23 +307,41 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(chat_panel)
         splitter.addWidget(tools_panel)
-        splitter.setSizes([600, 600])
+        splitter.setSizes([620, 480])
 
         # Layout raíz
         main_box = QVBoxLayout()
         main_box.addWidget(self.hints_title)
         main_box.addWidget(self.hints_text)
         main_box.addLayout(hints_row)
-
         main_box.addWidget(self.status_label)
         main_box.addWidget(splitter, stretch=1)
 
         root.setLayout(main_box)
 
-        # Inicializa el texto del banner
-        self.update_hints()
+    # ---------- Animación “pensando…” ----------
+    def _thinking_start(self):
+        self._thinking_dots = 0
+        if self._thinking_timer is None:
+            self._thinking_timer = QTimer(self)
+            self._thinking_timer.timeout.connect(self._thinking_tick)
+        self._thinking_timer.start(450)
+        self._thinking_tick()  # pinta inmediato
+        self.send_btn.setEnabled(False)
+        self.input_edit.setEnabled(False)
 
-    # ---------- Slots ----------
+    def _thinking_tick(self):
+        self._thinking_dots = (self._thinking_dots + 1) % 6
+        self.thinking_label.setText("assistant pensando" + "." * self._thinking_dots)
+
+    def _thinking_stop(self):
+        if self._thinking_timer:
+            self._thinking_timer.stop()
+        self.thinking_label.setText("")
+        self.send_btn.setEnabled(True)
+        self.input_edit.setEnabled(True)
+
+    # ---------- Slots (chat) ----------
     def append_chat(self, who: str, text: str):
         self.chat_view.append(f"<b>{who}:</b> {text}")
 
@@ -386,9 +356,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "MCP no conectado", "Revisa variables MCP_* en .env")
             return
 
+        self._last_user_text = text
         self.append_chat("you", text)
         self.input_edit.clear()
 
+        self._thinking_start()
         worker = ChatWorker(self.client, self.model, self.history, self.adapter, text)
         worker.done.connect(self.on_chat_done)
         worker.fail.connect(self.on_chat_fail)
@@ -396,209 +368,64 @@ class MainWindow(QMainWindow):
         self._chat_worker = worker  # mantener referencia
 
     def on_chat_done(self, assistant_text: str, assistant_blocks: list):
+        self._thinking_stop()
         self.append_chat("assistant", assistant_text)
-        # Actualiza history con la última interacción
+        # Actualiza history correctamente (evita bloques vacíos)
         self.history.extend([
-            {"role": "user", "content": self.chat_view.toPlainText().split("assistant:")[0] if self.history else [{"type":"text","text":""}]},
+            {"role": "user", "content": [{"type": "text", "text": self._last_user_text}]},
             {"role": "assistant", "content": assistant_blocks},
         ])
 
     def on_chat_fail(self, err: str):
+        self._thinking_stop()
         self.append_chat("assistant", f"[ERROR]\n{err}")
 
-    # ---------- Files helpers ----------
-    def _is_audio(self, path: str) -> bool:
-        ext = os.path.splitext(path)[1].lower()
-        return ext in SUPPORTED_EXTS
+    # ---------- Helper tabla ----------
+    def _row_to_dict(self, row_idx: int) -> dict:
+        get = self.results_table.item
+        def _val(c):
+            it = get(row_idx, c)
+            return "" if it is None else it.text()
+        return {
+            "path": _val(0),
+            "title": _val(1),
+            "artist": _val(2),
+            "duration": float(_val(3) or 0),
+            "bpm": float(_val(4) or 0),
+            "key": _val(5),
+            "mode": _val(6),
+            "energy": float(_val(7) or 0),
+            "brightness": float(_val(8) or 0),
+        }
 
-    def _add_files(self, paths: Iterable[str]):
-        added = 0
-        for p in paths:
-            if os.path.isfile(p) and self._is_audio(p):
-                if p not in self.pending_files:
-                    self.pending_files.add(p)
-                    added += 1
-        self.pending_label.setText(f"{len(self.pending_files)} archivos pendientes (+{added})")
-        # sugerencia en input con el último
-        if paths:
-            last = next(iter(reversed(list(paths))))
-            self.file_input.setText(last)
-        self.update_hints()
-
-    def on_browse_files(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Selecciona canciones",
-            os.path.expanduser("~"),
-            "Audio (*.mp3 *.wav *.flac *.m4a *.ogg)"
-        )
-        if files:
-            self._add_files(files)
-
-    def on_files_dropped(self, paths: List[str]):
-        self._add_files(paths)
-
-    # ---------- Table helpers ----------
-    def _append_track_row(self, r: dict):
-        i = self.results_table.rowCount()
-        self.results_table.insertRow(i)
-        def setc(col, val):
-            self.results_table.setItem(i, col, QTableWidgetItem(str(val)))
-        setc(0, r.get("path", ""))
-        setc(1, r.get("title", ""))
-        setc(2, r.get("artist", ""))
-        setc(3, f'{float(r.get("duration", 0)):.2f}')
-        setc(4, f'{float(r.get("bpm", 0)):.2f}')
-        setc(5, r.get("key", ""))
-        setc(6, r.get("mode", ""))
-        setc(7, f'{float(r.get("energy", 0)):.3f}')
-        setc(8, f'{float(r.get("brightness", 0)):.3f}')
-
-    def _set_tracks_table(self, rows: List[dict]):
+    def _set_table(self, rows: List[dict]):
         self.results_table.setRowCount(0)
         for r in rows:
-            self._append_track_row(r)
+            i = self.results_table.rowCount()
+            self.results_table.insertRow(i)
+            self.results_table.setItem(i, 0, QTableWidgetItem(str(r.get("path", ""))))
+            self.results_table.setItem(i, 1, QTableWidgetItem(str(r.get("title", ""))))
+            self.results_table.setItem(i, 2, QTableWidgetItem(str(r.get("artist", ""))))
+            self.results_table.setItem(i, 3, QTableWidgetItem(f'{float(r.get("duration", 0)):.2f}'))
+            self.results_table.setItem(i, 4, QTableWidgetItem(f'{float(r.get("bpm", 0)):.2f}'))
+            self.results_table.setItem(i, 5, QTableWidgetItem(str(r.get("key", ""))))
+            self.results_table.setItem(i, 6, QTableWidgetItem(str(r.get("mode", ""))))
+            self.results_table.setItem(i, 7, QTableWidgetItem(f'{float(r.get("energy", 0)):.3f}'))
+            self.results_table.setItem(i, 8, QTableWidgetItem(f'{float(r.get("brightness", 0)):.3f}'))
 
-    def _set_playlists_table(self, playlists: List[dict]):
-        self.playlists_table.setRowCount(0)
-        for pl in playlists:
-            i = self.playlists_table.rowCount()
-            self.playlists_table.insertRow(i)
-            self.playlists_table.setItem(i, 0, QTableWidgetItem(str(pl.get("name", ""))))
-            self.playlists_table.setItem(i, 1, QTableWidgetItem(str(pl.get("count", 0))))
+    # ---------- Drop → prellenar comando en chat ----------
+    def on_song_dropped(self, path: str):
+        # Guarda para hints
+        self._last_dropped_song = path
+        self.update_hints()
 
-    # ---------- MCP tool actions (direct) ----------
-    def on_add_songs(self):
-        if not self.adapter:
-            QMessageBox.warning(self, "MCP no conectado", "Revisa variables MCP_* en .env")
-            return
-
-        # también toma el texto del input como una sola canción (opcional)
-        text_path = self.file_input.text().strip()
-        if text_path and os.path.isfile(text_path):
-            self.pending_files.add(text_path)
-
-        if not self.pending_files:
-            QMessageBox.information(self, "Nada que añadir", "Arrastra o selecciona al menos una canción.")
-            return
-
-        added = 0
-        errors = []
-        for path in list(self.pending_files):
-            try:
-                result_str = self.adapter.call("add_song", {"path": path})
-                try:
-                    data = json.loads(result_str)
-                except Exception:
-                    data = {"raw": result_str}
-                if "track" in data:
-                    self._append_track_row(data["track"])
-                    added += 1
-            except Exception as e:
-                errors.append(f"{os.path.basename(path)}: {e}")
-            finally:
-                # consumimos la cola
-                self.pending_files.discard(path)
-
-        self.pending_label.setText(f"{len(self.pending_files)} archivos pendientes")
-        msg = f"{added} canción(es) añadidas."
-        if errors:
-            msg += f" Errores: {len(errors)}"
-        self.append_chat("assistant", msg)
-        if errors:
-            self.append_chat("assistant", "\n".join(errors))
-
-    def on_list_playlists(self):
-        if not self.adapter:
-            QMessageBox.warning(self, "MCP no conectado", "Revisa variables MCP_* en .env")
-            return
-        try:
-            result_str = self.adapter.call("list_playlists", {})
-            data = json.loads(result_str) if result_str else {}
-            pls = data.get("playlists", [])
-            self._set_playlists_table(pls)
-            self.append_chat("assistant", f"{len(pls)} playlist(s).")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-
-    def _selected_playlist_name(self) -> str:
-        # Usa el textbox si tiene algo, si no, intenta tomar la fila seleccionada
-        name = self.playlist_name_edit.text().strip()
-        if name:
-            return name
-        items = self.playlists_table.selectedItems()
-        if items:
-            # la primera columna tiene el nombre
-            row = items[0].row()
-            it = self.playlists_table.item(row, 0)
-            if it:
-                return it.text().strip()
-        return ""
-
-    def on_get_playlist(self):
-        if not self.adapter:
-            QMessageBox.warning(self, "MCP no conectado", "Revisa variables MCP_* en .env")
-            return
-        name = self._selected_playlist_name()
-        if not name:
-            QMessageBox.information(self, "Playlist requerida", "Escribe o selecciona una playlist.")
-            return
-        try:
-            result_str = self.adapter.call("get_playlist", {"name": name})
-            data = json.loads(result_str) if result_str else {}
-            rows = data.get("tracks", [])
-            self._set_tracks_table(rows)
-            self.notes_label.setText(f'Playlist "{name}" — {len(rows)} pistas')
-            self.append_chat("assistant", f'Playlist "{name}" mostrada ({len(rows)} pistas).')
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-
-    def on_export_playlist(self):
-        if not self.adapter:
-            QMessageBox.warning(self, "MCP no conectado", "Revisa variables MCP_* en .env")
-            return
-        name = self._selected_playlist_name()
-        if not name:
-            QMessageBox.information(self, "Playlist requerida", "Escribe o selecciona una playlist.")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Guardar CSV de playlist", os.path.expanduser(f"~/{name}.csv"), "CSV (*.csv)"
-        )
-        if not path:
-            return
-        try:
-            result_str = self.adapter.call("export_playlist", {"name": name, "csv_path": path})
-            data = json.loads(result_str) if result_str else {}
-            if data.get("error"):
-                QMessageBox.warning(self, "No exportado", data["error"])
-                return
-            rows = int(data.get("rows", 0))
-            self.append_chat("assistant", f'CSV exportado: {data.get("csv_path", path)} ({rows} filas).')
-            QMessageBox.information(self, "Exportado", f'Archivo guardado:\n{data.get("csv_path", path)}')
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-
-    def on_clear_library(self):
-        if not self.adapter:
-            QMessageBox.warning(self, "MCP no conectado", "Revisa variables MCP_* en .env")
-            return
-        try:
-            result_str = self.adapter.call("clear_library", {})
-            data = json.loads(result_str) if result_str else {}
-            if data.get("ok"):
-                self.results_table.setRowCount(0)
-                self.playlists_table.setRowCount(0)
-                self.pending_files.clear()
-                self.pending_label.setText("0 archivos pendientes")
-                self.notes_label.setText("")
-                self.append_chat("assistant", "Librería limpiada.")
-            else:
-                QMessageBox.warning(self, "Atención", "No se pudo limpiar la librería.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+        # Prellenar el comando en el input del chat (el usuario decide si enviar)
+        escaped = path.replace("\\", "\\\\")
+        cmd = f'Run the tool add_song with {{"path":"{escaped}"}}'
+        self.input_edit.setText(cmd)
+        self.append_chat("assistant", "Comando sugerido prellenado para analizar la canción (pulsa Enviar).")
 
 
-# ---------------- Entrypoint ----------------
 def main():
     app = QApplication([])
     win = MainWindow()

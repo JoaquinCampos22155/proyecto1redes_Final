@@ -14,16 +14,17 @@ class MCPError(RuntimeError):
 
 class MCPAdapter:
     """
-    Cliente MCP mínimo por STDIO usando framing newline-delimited (NDJSON):
-      • Cada mensaje es un objeto JSON-RPC en UNA sola línea terminada en '\n'
-      • Sin cabeceras "Content-Length"
-
+    Cliente MCP mínimo por STDIO usando framing newline-delimited:
+    - Cada mensaje es un objeto JSON-RPC en UNA sola línea terminada en '\n'
+    - Sin cabeceras "Content-Length"
     Implementa:
       - initialize + notifications/initialized
       - tools/list (descubrimiento)
       - tools/call (invocación)
 
-    Compatible con servidores FastMCP (mcp>=1.2) ejecutados con transport='stdio'.
+    timeout_s:
+      - None  => espera INDEFINIDA (sin timeout)
+      - float => segundos a esperar por respuesta
     """
 
     def __init__(
@@ -32,19 +33,12 @@ class MCPAdapter:
         args: list[str],
         cwd: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
-        timeout_s: float | None = None,
+        timeout_s: Optional[float] = None,  # ← por defecto: sin límite de tiempo
     ) -> None:
         if not command:
             raise MCPError("MCPAdapter requiere 'command' (ruta a python.exe u otro ejecutable)")
 
-        # Timeout (permite override por env; análisis de audio puede tardar)
-        if timeout_s is None:
-            try:
-                timeout_s = float(os.environ.get("MCP_TIMEOUT_S", "60"))
-            except Exception:
-                timeout_s = 60.0
-
-        # Fusiona entorno (preserva PYTHONPATH)
+        # Fusiona entorno
         merged_env = os.environ.copy()
         if env:
             if env.get("PYTHONPATH") and merged_env.get("PYTHONPATH"):
@@ -82,7 +76,7 @@ class MCPAdapter:
             raise MCPError("No se pudo abrir stdin/stdout del proceso MCP")
 
         # Infra de sincronización
-        self._timeout = float(timeout_s)
+        self._timeout: Optional[float] = timeout_s
         self._id = 0
         self._lock = threading.Lock()
         self._pending: dict[int, threading.Event] = {}
@@ -97,9 +91,6 @@ class MCPAdapter:
         self._stderr_reader = threading.Thread(target=self._stderr_loop, daemon=True)
         self._stderr_reader.start()
 
-        # Para que .tools exista aunque falle el listado
-        self.tools: list[dict[str, Any]] = []
-
         # --- Handshake MCP ---
         _ = self._request(
             method="initialize",
@@ -113,17 +104,14 @@ class MCPAdapter:
                 },
             },
         )
-        # Notificación post-handshake
         self._notify("notifications/initialized", {})
 
         # Descubre tools
         try:
             listing = self._request("tools/list", params={})
-            if isinstance(listing, dict):
-                self.tools = listing.get("tools", []) or []
+            self.tools = listing.get("tools", []) if isinstance(listing, dict) else []
         except Exception:
-            # deja self.tools = []
-            pass
+            self.tools = []
 
     # -------------------- API pública --------------------
 
@@ -133,13 +121,12 @@ class MCPAdapter:
     def call(self, name: str, arguments: Dict[str, Any]) -> str:
         """
         Invoca `tools/call` y devuelve texto amigable para el LLM.
-        Si el server retorna `{"content":[{"type":"text","text":"..."}]}`, lo concatena.
-        Si retorna otra estructura, se devuelve el JSON completo serializado.
+        Si el server retorna bloques `content[]` con 'text', se concatena.
+        En caso contrario, se devuelve el JSON completo serializado.
         """
         self._assert_alive()
         result = self._request("tools/call", {"name": name, "arguments": arguments})
 
-        # FastMCP suele envolver en {"content":[...]} o devolver payload directo
         if isinstance(result, dict) and "content" in result:
             content = result.get("content")
             if isinstance(content, list):
@@ -176,7 +163,7 @@ class MCPAdapter:
             return self._id
 
     def _write_msg(self, obj: dict) -> None:
-        """Escribe UNA línea JSON (sin saltos embebidos) + '\\n'."""
+        """Escribe UNA línea JSON (sin saltos embebidos) + '\n'."""
         data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         assert self.proc.stdin is not None
         self.proc.stdin.write(data + b"\n")
@@ -191,7 +178,6 @@ class MCPAdapter:
         try:
             return json.loads(line.decode("utf-8"))
         except Exception:
-            # línea inválida → ignora y sigue leyendo
             return {}
 
     def _reader_loop(self):
@@ -209,7 +195,6 @@ class MCPAdapter:
                     if ev is not None:
                         self._results[int(rid)] = msg
                         ev.set()
-                # Requests/notifications desde el server se ignoran en este cliente mínimo
             except Exception:
                 break
 
@@ -233,7 +218,9 @@ class MCPAdapter:
 
         self._write_msg({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
 
-        if not ev.wait(timeout=self._timeout):
+        # Espera (infinita si self._timeout es None)
+        ok = ev.wait(timeout=self._timeout) if self._timeout is not None else ev.wait()
+        if not ok:
             tail = "\n".join(self._stderr_tail)
             raise MCPError(
                 f"Timeout esperando respuesta a '{method}'.\n"
