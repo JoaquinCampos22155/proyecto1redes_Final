@@ -1,7 +1,17 @@
+# LLM opcional (si decides usarlo en otra rama)
 anthropic>=0.28.0
+
+# Cargar variables de .env automáticamente (usado por settings.py)
 python-dotenv>=1.0.1
+
+# CLI bonita / logs legibles (opcional; útil si amplías main.py)
 rich>=13.7.1
+
+# Validación de datos (opcional; útil si agregas modelos/DTOs en el host)
 pydantic>=2.7.0
-# Para modo MCP (adapter futuro)
+
+# Cliente MCP oficial opcional (para futuros adaptadores/experimentos)
 mcp[cli]>=1.2.0
+
+# GUI de escritorio (usada por host/gui_app.py)
 PySide6>=6.6

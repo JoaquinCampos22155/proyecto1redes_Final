@@ -1,189 +1,261 @@
 # host/main.py
 from __future__ import annotations
-import os
-import json
-from typing import Any
+import argparse, json, sys, shlex
+from typing import Any, Dict, Optional, List
 
-from dotenv import load_dotenv
-from rich.console import Console
-from anthropic import Anthropic
-
-from .tool_schemas import TOOLS
-from .mcp_adapter import MCPAdapter
-from .utils import ToolCall, env_list, norm_path, strip_quotes
-
-# --- Helpers para bloques de Anthropic ---
-def _block_type(b):
-    # Soporta objetos (pydantic) y dicts
-    return getattr(b, "type", None) if not isinstance(b, dict) else b.get("type")
-
-def blocks_to_text(blocks: list[dict | object]) -> str:
-    parts = []
-    for b in blocks:
-        if _block_type(b) == "text":
-            txt = getattr(b, "text", None) if not isinstance(b, dict) else b.get("text")
-            if isinstance(txt, str):
-                parts.append(txt)
-    return "\n".join(parts)
-
-def extract_tool_uses(blocks: list[dict | object]) -> list[ToolCall]:
-    calls: list[ToolCall] = []
-    for b in blocks:
-        if _block_type(b) == "tool_use":
-            name = getattr(b, "name", None) if not isinstance(b, dict) else b.get("name")
-            input_args = getattr(b, "input", None) if not isinstance(b, dict) else b.get("input")
-            tu_id = getattr(b, "id", None) if not isinstance(b, dict) else b.get("id")
-            calls.append(ToolCall(name=name, arguments=input_args or {}, tool_use_id=tu_id))
-    return calls
-
-def _tool_names_from_adapter(adapter) -> list[str]:
-    if hasattr(adapter, "tools") and isinstance(getattr(adapter, "tools"), list):
-        return [t.get("name") for t in adapter.tools if isinstance(t, dict)]
-    # Fallback (por si se ejecuta en DIRECT sin MCP)
-    return ["add_song", "list_playlists", "get_playlist", "export_playlist", "clear_library"]
-
-def format_welcome(names: list[str]) -> str:
-    example_song = "C:\\\\ruta\\\\a\\\\cancion.mp3"
-    example_csv  = "C:\\\\Users\\\\tuusuario\\\\setlist.csv"
-    lines = ["Opciones MCP disponibles:"]
-    if "add_song" in names:
-        lines.append(f'• Añadir canción → Run the tool add_song with {{"path":"{example_song}"}}')
-    if "list_playlists" in names:
-        lines.append('• Ver playlists → Run the tool list_playlists with {}')
-    if "get_playlist" in names:
-        lines.append('• Ver una playlist → Run the tool get_playlist with {"name":"Pop 100–130"}')
-    if "export_playlist" in names:
-        lines.append(f'• Exportar playlist → Run the tool export_playlist with {{"name":"Pop 100–130","csv_path":"{example_csv}"}}')
-    if "clear_library" in names:
-        lines.append('• Limpiar librería → Run the tool clear_library with {}')
-    lines.append("Tip: escribe help para volver a ver estas opciones.")
-    return "\n".join(lines)
-
-
-SYSTEM_PROMPT = (
-    "Eres Setlist Architect Host. Tienes herramientas para analizar audio local y sugerir setlists. "
-    "Usa herramientas cuando el usuario lo pida explícitamente o cuando mejore la respuesta. "
-    "Responde conciso y devuelve JSON cuando el usuario lo solicite."
+from host.settings import (
+    DEFAULT_WORKSPACE,
+    apply_windows_utf8_console,
+    print_startup_banner,
 )
+from host.mcp_adapter import MCPAdapter, MCPNeedsConfirmation, MCPServerError, MCPAdapterError
 
-console = Console()
+def jprint(obj: Any) -> None:
+    try:
+        print(json.dumps(obj, ensure_ascii=False, indent=2))
+    except Exception:
+        print(str(obj))
 
+def cmd_tools(args) -> int:
+    mcp = MCPAdapter(workspace=args.ws)
+    try:
+        jprint(mcp.get_tools_schema())
+        return 0
+    finally:
+        mcp.shutdown()
 
-def run_chat_loop():
-    load_dotenv()
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        console.print("[red]Falta ANTHROPIC_API_KEY en .env[/red]")
-        return
+def cmd_playlists(args) -> int:
+    mcp = MCPAdapter(workspace=args.ws)
+    try:
+        out = mcp.list_playlists()
+        jprint(out)
+        return 0
+    except Exception as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 2
+    finally:
+        mcp.shutdown()
 
-    model = (
-        os.environ.get("ANTHROPIC_MODEL")
-        or os.environ.get("MODEL")
-        or "claude-3-5-sonnet-20240620"
-    )
-    mode = os.environ.get("MODE", "mcp").lower()  # por defecto mcp para el nuevo flujo
+def cmd_add(args) -> int:
+    mcp = MCPAdapter(workspace=args.ws)
+    try:
+        if args.confirm is not None:
+            # confirmar usando índice directo
+            ok = mcp.add_song(args.title, args.artists or "", candidate_index=int(args.confirm))
+            jprint({"status":"ok", "chosen": ok.chosen})
+            return 0
 
-    client = Anthropic(api_key=api_key)
+        try:
+            ok = mcp.add_song(args.title, args.artists or "")
+            jprint({"status":"ok", "chosen": ok.chosen})
+            return 0
+        except MCPNeedsConfirmation as cf:
+            # Mostrar candidatos y sugerir confirmación
+            payload = {
+                "status":"needs_confirmation",
+                "message": cf.message,
+                "candidates": cf.candidates,  # list[dict]
+                "hint": f'Vuelve a ejecutar con --confirm <idx>, p. ej.: '
+                        f'add --ws {args.ws!s} --title {shlex.quote(args.title)}'
+                        + (f' --artists {shlex.quote(args.artists)}' if args.artists else '')
+                        + ' --confirm 0'
+            }
+            jprint(payload)
+            return 10
+    except MCPServerError as e:
+        print(f"[server-error] {e}", file=sys.stderr)
+        return 3
+    except MCPAdapterError as e:
+        print(f"[adapter-error] {e}", file=sys.stderr)
+        return 4
+    except Exception as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 2
+    finally:
+        mcp.shutdown()
 
-    # --- Adapter (MCP) ---
-    cmd = strip_quotes(os.environ.get("MCP_SERVER_CMD") or "")
-    args = env_list("MCP_SERVER_ARGS")  # p.ej. "-m,setlist_architect.server"
-    cwd = norm_path(os.environ.get("MCP_CWD"))
-    extra_env = {}
-    if os.environ.get("MCP_PYTHONPATH"):
-        extra_env["PYTHONPATH"] = norm_path(os.environ["MCP_PYTHONPATH"]) or ""
-    timeout = float(os.environ.get("MCP_TIMEOUT_S", "180"))
+def cmd_confirm(args) -> int:
+    # atajo explícito: confirmación separada
+    mcp = MCPAdapter(workspace=args.ws)
+    try:
+        ok = mcp.add_song(args.title, args.artists or "", candidate_index=int(args.index))
+        jprint({"status":"ok","chosen": ok.chosen})
+        return 0
+    except Exception as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 2
+    finally:
+        mcp.shutdown()
 
-    if mode != "mcp":
-        console.print("[yellow]MODE=direct: el flujo per-song requiere MODE=mcp; forzando MCP[/yellow]")
+def cmd_show(args) -> int:
+    mcp = MCPAdapter(workspace=args.ws)
+    try:
+        out = mcp.get_playlist(args.name)
+        jprint(out)
+        return 0
+    except Exception as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 2
+    finally:
+        mcp.shutdown()
 
-    adapter = MCPAdapter(cmd, args, cwd=cwd, env=extra_env, timeout_s=timeout)
-    console.print(
-        f"[cyan]MCP conectado. Tools detectadas: "
-        f"{[t.get('name') for t in getattr(adapter, 'tools', [])]}[/cyan]"
-    )
+def cmd_export(args) -> int:
+    mcp = MCPAdapter(workspace=args.ws)
+    try:
+        out = mcp.export_playlist(args.name)
+        jprint(out)  # { uri: file://..., rows: N }
+        return 0
+    except Exception as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 2
+    finally:
+        mcp.shutdown()
 
-    history: list[dict[str, Any]] = []
+def cmd_clear(args) -> int:
+    mcp = MCPAdapter(workspace=args.ws)
+    try:
+        out = mcp.clear_library()
+        jprint(out)
+        return 0
+    except Exception as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 2
+    finally:
+        mcp.shutdown()
 
-    # Mensaje inicial con ejemplos
-    names = _tool_names_from_adapter(adapter)
-    welcome = format_welcome(names)
-    print(f"assistant> {welcome}")
-    history.append({"role": "assistant", "content": [{"type": "text", "text": welcome}]})
+def cmd_schema(args) -> int:
+    # útil si tu LLM necesita registrar tools: imprime el JSON Schema “en vivo”
+    mcp = MCPAdapter(workspace=args.ws)
+    try:
+        tools = mcp.as_llm_tools()
+        jprint(tools)
+        return 0
+    finally:
+        mcp.shutdown()
 
-    console.print("[bold green]Setlist Architect CLI[/bold green] — escribe 'exit' para salir")
+def cmd_repl(args) -> int:
+    """
+    REPL de prueba minimal (no es GUI; solo útil para debug).
+    Comandos:
+      tools
+      playlists
+      add "<title>" [-a "<artists>"]
+      confirm <idx> (usa el último title/artists usados en esta sesión)
+      show "<playlist>"
+      export "<playlist>"
+      clear
+      quit/exit
+    """
+    mcp = MCPAdapter(workspace=args.ws)
+    print(f"[repl] workspace={args.ws}")
+    last_title, last_artists = None, None
     try:
         while True:
-            user = input("you> ").strip()
-            if user.lower() in {"exit", "quit", ":q"}:
-                break
-            if user.lower() in {"help", "ayuda"}:
-                welcome = format_welcome(names)
-                print(f"assistant> {welcome}")
-                history.append({"role": "assistant", "content": [{"type": "text", "text": welcome}]})
+            try:
+                raw = input("host> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+            if not raw: 
                 continue
-
-            # 1ª ronda: el modelo decide si usa tools
-            msg = client.messages.create(
-                model=model,
-                max_tokens=1024,
-                system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                messages=history + [{"role": "user", "content": user}],
-            )
-
-            tool_calls = extract_tool_uses(msg.content)
-            if tool_calls:
-                results_blocks: list[dict[str, Any]] = []
-                for tc in tool_calls:
-                    try:
-                        result_str = adapter.call(tc.name, tc.arguments)
-                    except Exception as e:
-                        result_str = json.dumps({"error": str(e)}, ensure_ascii=False)
-                    results_blocks.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tc.tool_use_id,
-                            "content": result_str,
-                        }
-                    )
-
-                # 2ª ronda: integra resultados de tools
-                follow = client.messages.create(
-                    model=model,
-                    max_tokens=1024,
-                    system=SYSTEM_PROMPT,
-                    tools=TOOLS,
-                    messages=history
-                    + [{"role": "user", "content": user}]
-                    + [{"role": "assistant", "content": msg.content}]  # incluye tool_use
-                    + [{"role": "user", "content": results_blocks}],
-                )
-                assistant_text = blocks_to_text(follow.content)
-                print(f"assistant> {assistant_text}")
-                history.extend(
-                    [
-                        {"role": "user", "content": user},
-                        {"role": "assistant", "content": follow.content},
-                    ]
-                )
-            else:
-                # Sin tools: respuesta directa
-                assistant_text = blocks_to_text(msg.content)
-                print(f"assistant> {assistant_text}")
-                history.extend(
-                    [
-                        {"role": "user", "content": user},
-                        {"role": "assistant", "content": msg.content},
-                    ]
-                )
+            if raw.lower() in ("quit","exit"):
+                return 0
+            if raw == "tools":
+                jprint(mcp.get_tools_schema()); continue
+            if raw == "playlists":
+                jprint(mcp.list_playlists()); continue
+            if raw.startswith("add "):
+                # parse muy simple
+                # admite: add "titulo" -a "artistas"
+                parts = shlex.split(raw)
+                title = None; artists = ""
+                i = 1
+                while i < len(parts):
+                    if parts[i] == "-a" and (i+1) < len(parts):
+                        artists = parts[i+1]; i += 2; continue
+                    if title is None:
+                        title = parts[i]
+                    else:
+                        title += " " + parts[i]
+                    i += 1
+                title = title or ""
+                try:
+                    ok = mcp.add_song(title, artists)
+                    jprint({"status":"ok","chosen": ok.chosen})
+                    last_title, last_artists = title, artists
+                except MCPNeedsConfirmation as cf:
+                    jprint({"status":"needs_confirmation","message":cf.message,"candidates":cf.candidates})
+                    last_title, last_artists = title, artists
+                continue
+            if raw.startswith("confirm "):
+                if last_title is None:
+                    print("No hay add previo en esta sesión.")
+                    continue
+                try:
+                    idx = int(raw.split()[1])
+                except Exception:
+                    print("Uso: confirm <idx>"); continue
+                ok = mcp.add_song(last_title, last_artists or "", candidate_index=idx)
+                jprint({"status":"ok","chosen": ok.chosen})
+                continue
+            if raw.startswith("show "):
+                name = raw[5:].strip().strip('"')
+                jprint(mcp.get_playlist(name)); continue
+            if raw.startswith("export "):
+                name = raw[7:].strip().strip('"')
+                jprint(mcp.export_playlist(name)); continue
+            if raw == "clear":
+                jprint(mcp.clear_library()); continue
+            print("Comando no reconocido. Usa: tools | playlists | add | confirm | show | export | clear | exit")
     finally:
-        try:
-            if isinstance(adapter, MCPAdapter):
-                adapter.close()
-        except Exception:
-            pass
+        mcp.shutdown()
 
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="host", description="Host/Chatbot MCP (console entrypoint)")
+    p.add_argument("--ws","--workspace", dest="ws", default=DEFAULT_WORKSPACE, help="Workspace/session id (default: %(default)s)")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("tools", help="Listar tools (schema)").set_defaults(func=cmd_tools)
+    sub.add_parser("playlists", help="Listar playlists").set_defaults(func=cmd_playlists)
+
+    ap = sub.add_parser("add", help="Añadir canción (y manejar confirmaciones)")
+    ap.add_argument("--title", required=True)
+    ap.add_argument("--artists", default="")
+    ap.add_argument("--confirm", type=int, help="Confirma un candidato por índice (0..n)")
+    ap.set_defaults(func=cmd_add)
+
+    cp = sub.add_parser("confirm", help="Confirmar una búsqueda previa usando índice")
+    cp.add_argument("--title", required=True)
+    cp.add_argument("--artists", default="")
+    cp.add_argument("--index", required=True, type=int)
+    cp.set_defaults(func=cmd_confirm)
+
+    sp = sub.add_parser("show", help="Ver una playlist")
+    sp.add_argument("--name", required=True)
+    sp.set_defaults(func=cmd_show)
+
+    ep = sub.add_parser("export", help="Exportar una playlist a XLSX (retorna file:// URI)")
+    ep.add_argument("--name", required=True)
+    ep.set_defaults(func=cmd_export)
+
+    sub.add_parser("clear", help="Vaciar la librería (mantiene nombres de playlists)").set_defaults(func=cmd_clear)
+
+    sub.add_parser("schema", help="Schema para registrar tools en un LLM").set_defaults(func=cmd_schema)
+
+    sub.add_parser("repl", help="REPL de prueba (interactivo)").set_defaults(func=cmd_repl)
+
+    return p
+
+def main(argv: Optional[List[str]] = None) -> int:
+    apply_windows_utf8_console()
+    print_startup_banner()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except KeyboardInterrupt:
+        return 130
 
 if __name__ == "__main__":
-    run_chat_loop()
+    sys.exit(main())

@@ -1,436 +1,461 @@
 # host/gui_app.py
 from __future__ import annotations
-import os
-import json
-import traceback
-from typing import Any, List, Optional
-
-from dotenv import load_dotenv
-from anthropic import Anthropic
+import sys, json, traceback, time
+from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit, QTextEdit,
-    QHBoxLayout, QVBoxLayout, QFileDialog, QTableWidget,
-    QTableWidgetItem, QFrame, QMessageBox, QSplitter, QSizePolicy
+    QHBoxLayout, QVBoxLayout, QTableWidget, QTableWidgetItem, QMessageBox,
+    QSplitter, QSizePolicy, QComboBox, QDialog, QDialogButtonBox, QHeaderView
 )
 
-from .tool_schemas import TOOLS
-    # seguimos usando el mismo schema (add_song, list_playlists, ... ya expuesto)
-from .mcp_adapter import MCPAdapter
-from .utils import env_list, norm_path, strip_quotes
+from anthropic import Anthropic
+from dotenv import load_dotenv
+import os
 
+from host.mcp_adapter import MCPAdapter, MCPNeedsConfirmation, MCPServerError
+from host.tool_schemas import TOOLS as GET_TOOLS  # schemas dinámicos (con fallback)
+from host.settings import DEFAULT_WORKSPACE, apply_windows_utf8_console, print_startup_banner
 
-# ---------------- Helpers Anthropic blocks ----------------
-def _block_type(b):
-    return getattr(b, "type", None) if not isinstance(b, dict) else b.get("type")
+# -------------------------------------------------------------------
+# Utilidades
+# -------------------------------------------------------------------
 
-def blocks_to_text(blocks: list[dict | object]) -> str:
+def _fmt_num(v: Any, ndigits: int = 2) -> str:
+    try:
+        if v is None: return ""
+        return f"{float(v):.{ndigits}f}"
+    except Exception:
+        return ""
+
+def _blocks_to_text(blocks: list[dict | object]) -> str:
+    def _type(b): return getattr(b, "type", None) if not isinstance(b, dict) else b.get("type")
     parts = []
     for b in blocks:
-        if _block_type(b) == "text":
+        if _type(b) == "text":
             txt = getattr(b, "text", None) if not isinstance(b, dict) else b.get("text")
             if isinstance(txt, str):
                 parts.append(txt)
-    return "\n".join(parts)
+    return "\n".join(parts).strip()
 
-class ToolCall:
-    def __init__(self, name: str, arguments: dict[str, Any], tool_use_id: str):
-        self.name = name
-        self.arguments = arguments
-        self.tool_use_id = tool_use_id
-
-def extract_tool_uses(blocks: list[dict | object]) -> list[ToolCall]:
-    calls: list[ToolCall] = []
+def _extract_tool_uses(blocks: list[dict | object]) -> list[dict]:
+    def _type(b): return getattr(b, "type", None) if not isinstance(b, dict) else b.get("type")
+    uses = []
     for b in blocks:
-        if _block_type(b) == "tool_use":
+        if _type(b) == "tool_use":
             name = getattr(b, "name", None) if not isinstance(b, dict) else b.get("name")
             input_args = getattr(b, "input", None) if not isinstance(b, dict) else b.get("input")
             tu_id = getattr(b, "id", None) if not isinstance(b, dict) else b.get("id")
-            calls.append(ToolCall(name=name, arguments=input_args or {}, tool_use_id=tu_id))
-    return calls
+            uses.append({"name": name, "arguments": input_args or {}, "id": tu_id})
+    return uses
 
+# -------------------------------------------------------------------
+# Diálogo de confirmación de candidatos (add_song)
+# -------------------------------------------------------------------
+
+class CandidateDialog(QDialog):
+    def __init__(self, candidates: List[Dict[str, Any]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Confirma la canción")
+        self.resize(700, 360)
+        self._selected_index: Optional[int] = None
+
+        layout = QVBoxLayout(self)
+        info = QLabel("Se encontraron múltiples coincidencias. Elige una:")
+        layout.addWidget(info)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["#", "Título", "Artistas", "Duración (s)", "Confianza", "Preview"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(self.table, 1)
+
+        for i, c in enumerate(candidates):
+            self.table.insertRow(i)
+            self.table.setItem(i, 0, QTableWidgetItem(str(i)))
+            self.table.setItem(i, 1, QTableWidgetItem(str(c.get("title", ""))))
+            self.table.setItem(i, 2, QTableWidgetItem(str(c.get("artists", ""))))
+            self.table.setItem(i, 3, QTableWidgetItem(_fmt_num(c.get("duration_sec"), 1)))
+            self.table.setItem(i, 4, QTableWidgetItem(_fmt_num(c.get("confidence"), 2)))
+            self.table.setItem(i, 5, QTableWidgetItem("sí" if c.get("preview_url") else "no"))
+
+        self.table.doubleClicked.connect(self._accept)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _accept(self):
+        idxs = self.table.selectionModel().selectedRows()
+        if not idxs:
+            QMessageBox.information(self, "Selecciona uno", "Elige un candidato.")
+            return
+        self._selected_index = idxs[0].row()
+        self.accept()
+
+    @property
+    def selected_index(self) -> Optional[int]:
+        return self._selected_index
+
+# -------------------------------------------------------------------
+# Worker de chat LLM (hilo): LLM → tool_use → tools → tool_result → LLM
+# -------------------------------------------------------------------
 
 SYSTEM_PROMPT = (
-    "Eres Setlist Architect Host. Tienes herramientas para analizar audio local y sugerir setlists. "
-    "Usa herramientas cuando el usuario lo pida explícitamente o cuando mejore la respuesta. "
-    "Responde conciso y devuelve JSON cuando el usuario lo solicite."
+    "Eres Setlist Architect Host. Tienes herramientas MCP para gestionar música: "
+    "add_song, list_playlists, get_playlist, export_playlist, clear_library. "
+    "Usa las tools cuando ayuden a cumplir la petición del usuario. "
+    "Sé conciso y, cuando corresponda, muestra datos útiles."
 )
 
-
-# ---------------- Worker de chat (hilo) ----------------
-class ChatWorker(QThread):
-    done = Signal(str, list)   # (assistant_text, assistant_blocks)
+class LLMWorker(QThread):
+    done = Signal(str, list)   # assistant_text, assistant_blocks
     fail = Signal(str)
+    refresh_hint = Signal()    # para refrescar tabla tras tool calls
 
-    def __init__(self, client: Anthropic, model: str, history: list[dict[str, Any]], adapter: MCPAdapter, user_text: str):
+    def __init__(self, client: Anthropic, model: str, history: list[dict], user_text: str, mcp: MCPAdapter):
         super().__init__()
         self.client = client
         self.model = model
         self.history = history
-        self.adapter = adapter
         self.user_text = user_text
+        self.mcp = mcp
+
+    def _call_tools(self, uses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        results_blocks: List[Dict[str, Any]] = []
+        for u in uses:
+            name = u["name"]; args = u["arguments"]; tu_id = u["id"]
+            try:
+                result_obj = self.mcp.call_tool(name, args or {})
+                # si add_song pidió confirmación (flujo especial)
+                if isinstance(result_obj, dict) and result_obj.get("status") == "needs_confirmation":
+                    # devolvemos tal cual para que el LLM pida confirmación textual al usuario
+                    payload = json.dumps(result_obj, ensure_ascii=False)
+                else:
+                    payload = json.dumps(result_obj, ensure_ascii=False)
+                results_blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu_id,
+                    "content": payload
+                })
+            except MCPNeedsConfirmation as cf:  # por si usaste wrappers directamente
+                payload = json.dumps({
+                    "status": "needs_confirmation",
+                    "candidates": cf.candidates,
+                    "message": cf.message
+                }, ensure_ascii=False)
+                results_blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu_id,
+                    "content": payload
+                })
+            except Exception as e:
+                err = json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+                results_blocks.append({"type":"tool_result","tool_use_id":tu_id,"content": err})
+        # Si ejecutamos tools que alteran estado, pide refrescar tabla
+        if any(u["name"] in ("add_song","clear_library") for u in uses):
+            self.refresh_hint.emit()
+        return results_blocks
 
     def run(self):
         try:
-            # 1ª ronda
-            msg = self.client.messages.create(
+            tools_schema = GET_TOOLS()  # dinámico (llama tools/list al MCP o usa fallback)
+            # Ronda 1
+            msg1 = self.client.messages.create(
                 model=self.model,
-                max_tokens=1024,
                 system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                messages=self.history + [{"role": "user", "content": self.user_text}],
+                tools=tools_schema,
+                max_tokens=1024,
+                messages=self.history + [{"role":"user","content": self.user_text}],
             )
-            tool_calls = extract_tool_uses(msg.content)
-            if tool_calls:
-                results_blocks: list[dict[str, Any]] = []
-                for tc in tool_calls:
-                    try:
-                        result_str = self.adapter.call(tc.name, tc.arguments)
-                    except Exception as e:
-                        result_str = json.dumps({"error": str(e)}, ensure_ascii=False)
-                    results_blocks.append({
-                        "type": "tool_result",
-                        "tool_use_id": tc.tool_use_id,
-                        "content": result_str,
-                    })
-                follow = self.client.messages.create(
+            uses = _extract_tool_uses(msg1.content)
+            if not uses:
+                text = _blocks_to_text(msg1.content)
+                self.done.emit(text, msg1.content)
+                return
+
+            # Ejecutar tools y seguir
+            tool_results = self._call_tools(uses)
+            msg2 = self.client.messages.create(
+                model=self.model,
+                system=SYSTEM_PROMPT,
+                tools=tools_schema,
+                max_tokens=1024,
+                messages=self.history
+                    + [{"role":"user","content": self.user_text}]
+                    + [{"role":"assistant","content": msg1.content}]
+                    + [{"role":"user","content": tool_results}],
+            )
+            uses2 = _extract_tool_uses(msg2.content)
+            if uses2:
+                # (loop simple 2ª vuelta por si el modelo encadena otra tool)
+                tool_results2 = self._call_tools(uses2)
+                msg3 = self.client.messages.create(
                     model=self.model,
-                    max_tokens=1024,
                     system=SYSTEM_PROMPT,
-                    tools=TOOLS,
+                    tools=tools_schema,
+                    max_tokens=1024,
                     messages=self.history
-                    + [{"role": "user", "content": self.user_text}]
-                    + [{"role": "assistant", "content": msg.content}]
-                    + [{"role": "user", "content": results_blocks}],
+                        + [{"role":"user","content": self.user_text}]
+                        + [{"role":"assistant","content": msg1.content}]
+                        + [{"role":"user","content": tool_results}]
+                        + [{"role":"assistant","content": msg2.content}]
+                        + [{"role":"user","content": tool_results2}],
                 )
-                assistant_text = blocks_to_text(follow.content)
-                self.done.emit(assistant_text, follow.content)
-            else:
-                assistant_text = blocks_to_text(msg.content)
-                self.done.emit(assistant_text, msg.content)
+                text = _blocks_to_text(msg3.content)
+                self.done.emit(text, msg3.content)
+                return
+
+            text = _blocks_to_text(msg2.content)
+            self.done.emit(text, msg2.content)
+
         except Exception as e:
             self.fail.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
+# -------------------------------------------------------------------
+# Ventana principal (GUI)
+# -------------------------------------------------------------------
 
-# ---------------- Drop Area para archivos (solo drop) ----------------
-class DropArea(QFrame):
-    pathDropped = Signal(str)  # absoluta
-
-    def __init__(self):
-        super().__init__()
-        self.setFrameStyle(QFrame.StyledPanel | QFrame.Plain)
-        self.setStyleSheet("QFrame { border: 2px dashed #888; border-radius: 8px; }")
-        self.setAcceptDrops(True)
-        lbl = QLabel("Arrastra aquí una canción (MP3/WAV/FLAC/M4A/OGG)")
-        lbl.setAlignment(Qt.AlignCenter)
-        font = QFont()
-        font.setPointSize(10)
-        lbl.setFont(font)
-        layout = QVBoxLayout(self)
-        layout.addWidget(lbl)
-
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event: QDropEvent):
-        urls = event.mimeData().urls()
-        if not urls:
-            return
-        first = urls[0].toLocalFile()
-        if not first:
-            return
-        self.pathDropped.emit(first)
-
-
-# ---------------- Ventana principal ----------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Setlist Architect — Chat + MCP")
-        self.resize(1100, 740)
+        self.setWindowTitle("Setlist Architect — Host MCP (LLM)")
+        self.resize(1200, 780)
 
+        # LLM
         load_dotenv()
-        self.api_key = os.environ.get("ANTHROPIC_API_KEY")
-        self.model = os.environ.get("ANTHROPIC_MODEL") or os.environ.get("MODEL") or "claude-3-5-sonnet-20240620"
-        if not self.api_key:
-            QMessageBox.critical(self, "Falta API Key", "Define ANTHROPIC_API_KEY en tu .env")
-        self.client = Anthropic(api_key=self.api_key) if self.api_key else None
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            QMessageBox.critical(self, "Falta ANTHROPIC_API_KEY", "Define ANTHROPIC_API_KEY en .env")
+            raise SystemExit(2)
+        self.model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022")
+        self.client = Anthropic(api_key=api_key)
 
-        # Conectar MCP al iniciar (timeout infinito si MCP_TIMEOUT_S no está)
-        self.adapter: Optional[MCPAdapter] = None
-        self._connect_mcp()
+        # MCP
+        self.workspace: str = DEFAULT_WORKSPACE
+        self.mcp = MCPAdapter(workspace=self.workspace)
 
-        # Historial de conversación
-        self.history: list[dict[str, Any]] = []
-        self._last_user_text: str = ""
+        # Estado de chat
+        self.history: List[Dict[str, Any]] = []
+        self._last_user_text = ""
 
-        # UI
         self._build_ui()
-        self.update_hints()
-
-        # Animación "pensando…"
         self._thinking_timer: Optional[QTimer] = None
         self._thinking_dots: int = 0
 
-    # ---------- Conexión MCP ----------
-    def _connect_mcp(self):
-        try:
-            cmd = strip_quotes(os.environ.get("MCP_SERVER_CMD") or "")
-            args = env_list("MCP_SERVER_ARGS")
-            cwd = norm_path(os.environ.get("MCP_CWD"))
-            extra_env = {}
-            if os.environ.get("MCP_PYTHONPATH"):
-                extra_env["PYTHONPATH"] = norm_path(os.environ["MCP_PYTHONPATH"]) or ""
-            # Si MCP_TIMEOUT_S no está → None = espera infinita
-            tval = os.environ.get("MCP_TIMEOUT_S")
-            timeout = float(tval) if tval not in (None, "",) else None
-            self.adapter = MCPAdapter(cmd, args, cwd=cwd, env=extra_env, timeout_s=timeout)
-            tools = [t.get("name") for t in getattr(self.adapter, "tools", [])]
-            self.mcp_status = f"Conectado (tools: {tools})"
-        except Exception as e:
-            self.adapter = None
-            self.mcp_status = f"Error MCP: {e}"
+        self._refresh_playlists()
+        self._refresh_library_table()
 
-    # ---------- Hints (comandos MCP) ----------
-    def _escape_path(self, p: str) -> str:
-        return p.replace("\\", "\\\\").strip()
+    # ---------------- UI ----------------
 
-    def _build_hints_text(self) -> str:
-        # usa la última canción dropeada para prellenar
-        song = getattr(self, "_last_dropped_song", "") or "C:\\\\ruta\\\\a\\\\cancion.mp3"
-        song = self._escape_path(song)
-        csv_path = self._escape_path(os.path.join(os.path.expanduser("~"), "setlist.csv"))
-
-        lines = [
-            "Comandos MCP sugeridos:",
-            f'• Añadir canción → Run the tool add_song with {{"path":"{song}"}}',
-            '• Ver playlists → Run the tool list_playlists with {}',
-            '• Ver una playlist → Run the tool get_playlist with {"name":"Pop 100–130"}',
-            f'• Exportar playlist → Run the tool export_playlist with {{"name":"Pop 100–130","csv_path":"{csv_path}"}}',
-            '• Limpiar librería → Run the tool clear_library with {}',
-            "(Copia y pega estos comandos en el chat de la izquierda.)",
-        ]
-        return "\n".join(lines)
-
-    def update_hints(self):
-        self.hints_text.setPlainText(self._build_hints_text())
-
-    def copy_hints(self):
-        QApplication.clipboard().setText(self.hints_text.toPlainText())
-        QMessageBox.information(self, "Copiado", "Comandos copiados al portapapeles.")
-
-    # ---------- UI ----------
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
 
-        # --- Hints de comandos MCP (banner superior) ---
-        self.hints_title = QLabel("Cómo usar el MCP (comandos sugeridos)")
-        font = QFont()
-        font.setBold(True)
-        self.hints_title.setFont(font)
+        # Banner & estado
+        self.banner = QLabel(f"Workspace: <b>{self.workspace}</b>  •  Modelo: <b>{self.model}</b>")
+        self.banner.setWordWrap(True)
 
-        self.hints_text = QTextEdit()
-        self.hints_text.setReadOnly(True)
-        self.hints_text.setMaximumHeight(120)
-
-        self.hints_refresh = QPushButton("Actualizar")
-        self.hints_refresh.clicked.connect(self.update_hints)
-        self.hints_copy = QPushButton("Copiar")
-        self.hints_copy.clicked.connect(self.copy_hints)
-
-        hints_row = QHBoxLayout()
-        hints_row.addWidget(self.hints_refresh)
-        hints_row.addWidget(self.hints_copy)
-        hints_row.addStretch(1)
-
-        # Estado MCP
-        self.status_label = QLabel(self.mcp_status)
-        self.status_label.setWordWrap(True)
-
-        # -------- Panel Chat --------
-        self.chat_view = QTextEdit()
-        self.chat_view.setReadOnly(True)
-
+        # --- Panel Chat (izquierda) ---
+        self.chat_view = QTextEdit(); self.chat_view.setReadOnly(True)
         self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText('Escribe tu mensaje… (ej: Run the tool add_song with {"path":"C:\\\\...\\\\file.mp3"})')
-        self.send_btn = QPushButton("Enviar")
-        self.send_btn.clicked.connect(self.on_send)
-
-        # Indicador de “pensando…”
-        self.thinking_label = QLabel("")
-        self.thinking_label.setStyleSheet("color: #777;")
+        self.input_edit.setPlaceholderText('Habla natural: "añade Blinding Lights de The Weeknd y muéstrame las playlists"...')
+        self.input_edit.returnPressed.connect(self.on_send)
+        self.send_btn = QPushButton("Enviar"); self.send_btn.clicked.connect(self.on_send)
+        self.thinking_label = QLabel(""); self.thinking_label.setStyleSheet("color:#777;")
 
         chat_box = QVBoxLayout()
         chat_box.addWidget(QLabel("Chat"))
-        chat_box.addWidget(self.chat_view, stretch=1)
+        chat_box.addWidget(self.chat_view, 1)
+        io = QHBoxLayout(); io.addWidget(self.input_edit, 1); io.addWidget(self.send_btn); chat_box.addLayout(io)
         chat_box.addWidget(self.thinking_label)
+        chat_panel = QWidget(); chat_panel.setLayout(chat_box)
 
-        input_row = QHBoxLayout()
-        input_row.addWidget(self.input_edit, stretch=1)
-        input_row.addWidget(self.send_btn)
-        chat_box.addLayout(input_row)
+        # --- Panel derecho: filtros + referencia + tabla ---
+        right_box = QVBoxLayout()
 
-        chat_panel = QWidget()
-        chat_panel.setLayout(chat_box)
+        # Fila de controles (solo filtro + refrescar)
+        ctrl_row = QHBoxLayout()
+        self.playlist_filter = QComboBox(); self.playlist_filter.addItem("Todas")
+        self.playlist_filter.currentIndexChanged.connect(self._refresh_library_table)
+        self.btn_refresh = QPushButton("Refrescar"); self.btn_refresh.clicked.connect(self._refresh_all)
+        ctrl_row.addWidget(QLabel("Playlist:")); ctrl_row.addWidget(self.playlist_filter, 1)
+        ctrl_row.addStretch(1); ctrl_row.addWidget(self.btn_refresh)
+        right_box.addLayout(ctrl_row)
 
-        # -------- Panel Derecho minimalista --------
-        tools_box = QVBoxLayout()
-        tools_box.addWidget(QLabel("Arrastra una canción"))
+        # Referencia de funciones (para prompts)
+        self.ref_text = QTextEdit(); self.ref_text.setReadOnly(True); self.ref_text.setMaximumHeight(200)
+        self.ref_text.setPlainText(self._build_reference_text())
+        right_box.addWidget(QLabel("Referencia de funciones MCP (para guiar tus prompts)"))
+        right_box.addWidget(self.ref_text)
 
-        self.drop_area = DropArea()
-        self.drop_area.setMinimumHeight(110)
-        self.drop_area.pathDropped.connect(self.on_song_dropped)
-        tools_box.addWidget(self.drop_area)
+        # Tabla principal
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(["Título","Artistas","BPM","Key","Mode","Energy","Brightness","Duración (s)","Playlist"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        right_box.addWidget(self.table, 1)
 
-        # Resultados
-        self.notes_label = QLabel("")
-        self.results_table = QTableWidget(0, 9)
-        self.results_table.setHorizontalHeaderLabels(
-            ["path", "title", "artist", "duration", "bpm", "key", "mode", "energy", "brightness"]
-        )
-        self.results_table.horizontalHeader().setStretchLastSection(True)
-        self.results_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-        tools_box.addWidget(QLabel("Notas / Métricas"))
-        tools_box.addWidget(self.notes_label)
-        tools_box.addWidget(QLabel("Resultados"))
-        tools_box.addWidget(self.results_table, stretch=1)
-
-        tools_panel = QWidget()
-        tools_panel.setLayout(tools_box)
+        right_panel = QWidget(); right_panel.setLayout(right_box)
 
         # Splitter
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(chat_panel)
-        splitter.addWidget(tools_panel)
-        splitter.setSizes([620, 480])
+        splitter = QSplitter(Qt.Horizontal); splitter.addWidget(chat_panel); splitter.addWidget(right_panel)
+        splitter.setSizes([520, 680])
 
-        # Layout raíz
-        main_box = QVBoxLayout()
-        main_box.addWidget(self.hints_title)
-        main_box.addWidget(self.hints_text)
-        main_box.addLayout(hints_row)
-        main_box.addWidget(self.status_label)
-        main_box.addWidget(splitter, stretch=1)
+        main = QVBoxLayout(); main.addWidget(self.banner); main.addWidget(splitter, 1)
+        root.setLayout(main)
 
-        root.setLayout(main_box)
+    def _build_reference_text(self) -> str:
+        return (
+            "Pídele al asistente cosas como:\n"
+            "• “Añade ‘Blinding Lights’ de The Weeknd y dime en qué playlist cayó.”\n"
+            "• “Lista las playlists y cuántas canciones tienen.”\n"
+            "• “Enséñame la playlist Workout y exporta la Chill.”\n"
+            "• “Limpia la librería.”\n"
+            "\n"
+            "Herramientas disponibles (nombres exactos):\n"
+            "• add_song  → args: {title: str, artists?: str}\n"
+            "• list_playlists → args: {}\n"
+            "• get_playlist  → args: {name: str}\n"
+            "• export_playlist → args: {name: str} (genera .xlsx y devuelve file://...)\n"
+            "• clear_library → args: {}\n"
+            "\n"
+            "Notas:\n"
+            "• El asistente decide cuándo llamar a cada tool.\n"
+            "• El workspace se inyecta automáticamente desde el host.\n"
+        )
 
-    # ---------- Animación “pensando…” ----------
-    def _thinking_start(self):
-        self._thinking_dots = 0
-        if self._thinking_timer is None:
-            self._thinking_timer = QTimer(self)
-            self._thinking_timer.timeout.connect(self._thinking_tick)
-        self._thinking_timer.start(450)
-        self._thinking_tick()  # pinta inmediato
-        self.send_btn.setEnabled(False)
-        self.input_edit.setEnabled(False)
+    # ---------------- Utilidades de UI ----------------
 
-    def _thinking_tick(self):
-        self._thinking_dots = (self._thinking_dots + 1) % 6
-        self.thinking_label.setText("assistant pensando" + "." * self._thinking_dots)
-
-    def _thinking_stop(self):
-        if self._thinking_timer:
-            self._thinking_timer.stop()
-        self.thinking_label.setText("")
-        self.send_btn.setEnabled(True)
-        self.input_edit.setEnabled(True)
-
-    # ---------- Slots (chat) ----------
     def append_chat(self, who: str, text: str):
         self.chat_view.append(f"<b>{who}:</b> {text}")
 
+    def _thinking_start(self):
+        self._thinking_dots = 0
+        if not hasattr(self, "_thinking_timer") or self._thinking_timer is None:
+            self._thinking_timer = QTimer(self)
+            self._thinking_timer.timeout.connect(self._thinking_tick)
+        self._thinking_timer.start(450); self._thinking_tick()
+        self.send_btn.setEnabled(False); self.input_edit.setEnabled(False)
+
+    def _thinking_tick(self):
+        self._thinking_dots = (self._thinking_dots + 1) % 6
+        self.thinking_label.setText("pensando" + "." * self._thinking_dots)
+
+    def _thinking_stop(self):
+        if getattr(self, "_thinking_timer", None):
+            self._thinking_timer.stop()
+        self.thinking_label.setText(""); self.send_btn.setEnabled(True); self.input_edit.setEnabled(True)
+
+    # ---------------- Acciones de alto nivel ----------------
+
+    def _refresh_all(self):
+        self._refresh_playlists()
+        self._refresh_library_table()
+
+    def _refresh_playlists(self):
+        try:
+            pls = self.mcp.list_playlists()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"No se pudo listar playlists:\n{e}")
+            return
+        current = self.playlist_filter.currentText() if self.playlist_filter.count() else "Todas"
+        self.playlist_filter.blockSignals(True)
+        self.playlist_filter.clear(); self.playlist_filter.addItem("Todas")
+        for p in sorted(pls, key=lambda x: x["name"].lower()):
+            self.playlist_filter.addItem(p["name"])
+        idx = self.playlist_filter.findText(current)
+        self.playlist_filter.setCurrentIndex(idx if idx >= 0 else 0)
+        self.playlist_filter.blockSignals(False)
+
+    def _collect_all_songs(self) -> List[Dict[str, Any]]:
+        songs_by_id: Dict[str, Dict[str, Any]] = {}
+        pls = self.mcp.list_playlists()
+        for p in pls:
+            name = p["name"]
+            data = self.mcp.get_playlist(name)
+            for s in data.get("songs", []):
+                sid = str(s.get("song_id"))
+                if sid not in songs_by_id:
+                    sc = dict(s); sc["playlist"] = name
+                    songs_by_id[sid] = sc
+        return list(songs_by_id.values())
+
+    def _refresh_library_table(self):
+        try:
+            songs = self._collect_all_songs()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"No se pudo leer la librería:\n{e}")
+            return
+
+        flt = self.playlist_filter.currentText()
+        if flt and flt != "Todas":
+            songs = [s for s in songs if s.get("playlist") == flt]
+
+        self.table.setRowCount(0)
+        for s in songs:
+            r = self.table.rowCount(); self.table.insertRow(r)
+            self.table.setItem(r, 0, QTableWidgetItem(str(s.get("title", ""))))
+            self.table.setItem(r, 1, QTableWidgetItem(str(s.get("artists", ""))))
+            self.table.setItem(r, 2, QTableWidgetItem(_fmt_num(s.get("bpm"), 2)))
+            self.table.setItem(r, 3, QTableWidgetItem(str(s.get("key", ""))))
+            self.table.setItem(r, 4, QTableWidgetItem(str(s.get("mode", ""))))
+            self.table.setItem(r, 5, QTableWidgetItem(_fmt_num(s.get("energy"), 3)))
+            self.table.setItem(r, 6, QTableWidgetItem(_fmt_num(s.get("brightness"), 3)))
+            self.table.setItem(r, 7, QTableWidgetItem(_fmt_num(s.get("duration_sec"), 1)))
+            self.table.setItem(r, 8, QTableWidgetItem(str(s.get("playlist", ""))))
+        self.table.resizeRowsToContents()
+
+    # ---------------- Chat (LLM) ----------------
+
     def on_send(self):
         text = self.input_edit.text().strip()
-        if not text:
-            return
-        if not self.client or not self.api_key:
-            QMessageBox.warning(self, "Sin API", "Configura ANTHROPIC_API_KEY en .env")
-            return
-        if not self.adapter:
-            QMessageBox.warning(self, "MCP no conectado", "Revisa variables MCP_* en .env")
-            return
-
-        self._last_user_text = text
-        self.append_chat("you", text)
+        if not text: return
+        self.append_chat("tú", text)
         self.input_edit.clear()
-
+        self._last_user_text = text
         self._thinking_start()
-        worker = ChatWorker(self.client, self.model, self.history, self.adapter, text)
-        worker.done.connect(self.on_chat_done)
-        worker.fail.connect(self.on_chat_fail)
+
+        worker = LLMWorker(self.client, self.model, self.history, text, self.mcp)
+        worker.done.connect(self._on_llm_done)
+        worker.fail.connect(self._on_llm_fail)
+        worker.refresh_hint.connect(self._refresh_all)
         worker.start()
-        self._chat_worker = worker  # mantener referencia
+        self._llm_worker = worker
 
-    def on_chat_done(self, assistant_text: str, assistant_blocks: list):
+    def _on_llm_done(self, assistant_text: str, blocks: list):
         self._thinking_stop()
-        self.append_chat("assistant", assistant_text)
-        # Actualiza history correctamente (evita bloques vacíos)
+        self.append_chat("assistant", assistant_text or "(sin texto)")
+        # Actualizar history (preserva bloques originales)
         self.history.extend([
-            {"role": "user", "content": [{"type": "text", "text": self._last_user_text}]},
-            {"role": "assistant", "content": assistant_blocks},
+            {"role": "user", "content": self._last_user_text},
+            {"role": "assistant", "content": blocks},
         ])
+        # refrescar por si el modelo pidió listados
+        self._refresh_all()
 
-    def on_chat_fail(self, err: str):
+    def _on_llm_fail(self, err: str):
         self._thinking_stop()
-        self.append_chat("assistant", f"[ERROR]\n{err}")
+        self.append_chat("assistant", f"[ERROR]\n<pre>{err}</pre>")
 
-    # ---------- Helper tabla ----------
-    def _row_to_dict(self, row_idx: int) -> dict:
-        get = self.results_table.item
-        def _val(c):
-            it = get(row_idx, c)
-            return "" if it is None else it.text()
-        return {
-            "path": _val(0),
-            "title": _val(1),
-            "artist": _val(2),
-            "duration": float(_val(3) or 0),
-            "bpm": float(_val(4) or 0),
-            "key": _val(5),
-            "mode": _val(6),
-            "energy": float(_val(7) or 0),
-            "brightness": float(_val(8) or 0),
-        }
-
-    def _set_table(self, rows: List[dict]):
-        self.results_table.setRowCount(0)
-        for r in rows:
-            i = self.results_table.rowCount()
-            self.results_table.insertRow(i)
-            self.results_table.setItem(i, 0, QTableWidgetItem(str(r.get("path", ""))))
-            self.results_table.setItem(i, 1, QTableWidgetItem(str(r.get("title", ""))))
-            self.results_table.setItem(i, 2, QTableWidgetItem(str(r.get("artist", ""))))
-            self.results_table.setItem(i, 3, QTableWidgetItem(f'{float(r.get("duration", 0)):.2f}'))
-            self.results_table.setItem(i, 4, QTableWidgetItem(f'{float(r.get("bpm", 0)):.2f}'))
-            self.results_table.setItem(i, 5, QTableWidgetItem(str(r.get("key", ""))))
-            self.results_table.setItem(i, 6, QTableWidgetItem(str(r.get("mode", ""))))
-            self.results_table.setItem(i, 7, QTableWidgetItem(f'{float(r.get("energy", 0)):.3f}'))
-            self.results_table.setItem(i, 8, QTableWidgetItem(f'{float(r.get("brightness", 0)):.3f}'))
-
-    # ---------- Drop → prellenar comando en chat ----------
-    def on_song_dropped(self, path: str):
-        # Guarda para hints
-        self._last_dropped_song = path
-        self.update_hints()
-
-        # Prellenar el comando en el input del chat (el usuario decide si enviar)
-        escaped = path.replace("\\", "\\\\")
-        cmd = f'Run the tool add_song with {{"path":"{escaped}"}}'
-        self.input_edit.setText(cmd)
-        self.append_chat("assistant", "Comando sugerido prellenado para analizar la canción (pulsa Enviar).")
-
+# -------------------------------------------------------------------
+# Entry point
+# -------------------------------------------------------------------
 
 def main():
-    app = QApplication([])
+    apply_windows_utf8_console()
+    print_startup_banner()
+    app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
-    app.exec()
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()
