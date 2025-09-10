@@ -1,21 +1,20 @@
 # host/gui_app.py
 from __future__ import annotations
-import sys, json, traceback, time
+import sys, json, traceback
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit, QTextEdit,
     QHBoxLayout, QVBoxLayout, QTableWidget, QTableWidgetItem, QMessageBox,
-    QSplitter, QSizePolicy, QComboBox, QDialog, QDialogButtonBox, QHeaderView
+    QSplitter, QSizePolicy, QDialog, QDialogButtonBox, QHeaderView
 )
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
 import os
 
-from host.mcp_adapter import MCPAdapter, MCPNeedsConfirmation, MCPServerError
-from host.tool_schemas import TOOLS as GET_TOOLS  # schemas dinámicos (con fallback)
+from host.mcp_adapter import MCPAdapter, MCPNeedsConfirmation
 from host.settings import DEFAULT_WORKSPACE, apply_windows_utf8_console, print_startup_banner
 
 # -------------------------------------------------------------------
@@ -50,8 +49,33 @@ def _extract_tool_uses(blocks: list[dict | object]) -> list[dict]:
             uses.append({"name": name, "arguments": input_args or {}, "id": tu_id})
     return uses
 
+def _normalize_blocks(blocks: list[dict | object]) -> list[dict]:
+    """Convierte bloques Anthropic a dicts 'limpios' para guardar en history."""
+    out: list[dict] = []
+    for b in blocks:
+        if isinstance(b, dict):
+            out.append(b); continue
+        typ = getattr(b, "type", None)
+        if not typ: continue
+        d: dict = {"type": typ}
+        if typ == "text":
+            d["text"] = getattr(b, "text", "") or ""
+        elif typ == "tool_use":
+            d["id"] = getattr(b, "id", None)
+            d["name"] = getattr(b, "name", None)
+            d["input"] = getattr(b, "input", {}) or {}
+        elif typ == "tool_result":
+            d["tool_use_id"] = getattr(b, "tool_use_id", None)
+            content = getattr(b, "content", "")
+            if isinstance(content, list):
+                d["content"] = content
+            else:
+                d["content"] = [{"type": "text", "text": str(content) if content is not None else ""}]
+        out.append(d)
+    return out
+
 # -------------------------------------------------------------------
-# Diálogo de confirmación de candidatos (add_song)
+# (Opcional) Diálogo para confirmación de candidatos en add_song
 # -------------------------------------------------------------------
 
 class CandidateDialog(QDialog):
@@ -65,13 +89,14 @@ class CandidateDialog(QDialog):
         info = QLabel("Se encontraron múltiples coincidencias. Elige una:")
         layout.addWidget(info)
 
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["#", "Título", "Artistas", "Duración (s)", "Confianza", "Preview"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        layout.addWidget(self.table, 1)
+        table = QTableWidget(0, 6)
+        table.setHorizontalHeaderLabels(["#", "Título", "Artistas", "Duración (s)", "Confianza", "Preview"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(table, 1)
+        self.table = table
 
         for i, c in enumerate(candidates):
             self.table.insertRow(i)
@@ -102,20 +127,66 @@ class CandidateDialog(QDialog):
         return self._selected_index
 
 # -------------------------------------------------------------------
+# Prompt dinámico según tools disponibles
+# -------------------------------------------------------------------
+
+def _build_system_prompt_for_tools(tools_schema: List[Dict[str, Any]]) -> str:
+    names = {t.get("name","") for t in tools_schema}
+
+    # Heurística: Filesystem server
+    fs_tools = {"list_allowed_directories", "write_file", "read_text_file", "create_directory"}
+    is_fs = fs_tools.issubset(names)
+
+    # Heurística: Setlist server
+    music_tools = {"add_song", "list_playlists", "get_playlist", "export_playlist", "clear_library"}
+    is_music = music_tools.issubset(names)
+
+    base = (
+        "Eres el Host MCP. Puedes llamar herramientas MCP cuando ayuden a cumplir la petición del usuario.\n"
+        "- Devuelve respuestas claras y concisas.\n"
+        "- Cuando llames una tool, espera su resultado y resume lo hecho.\n"
+    )
+
+    fs_part = (
+        "\n[Instrucciones para sistema de archivos]\n"
+        "1) Llama primero a list_allowed_directories para conocer la(s) carpeta(s) permitida(s).\n"
+        "2) Usa la PRIMERA ruta permitida como raíz por defecto.\n"
+        "3) Resuelve rutas relativas dentro de esa raíz (p. ej., raiz + '/docs/README.md').\n"
+        "4) Si no existe la carpeta destino, crea la jerarquía con create_directory antes de escribir/mover.\n"
+        "5) Para crear/actualizar archivo: write_file. Para mostrar contenido: read_text_file.\n"
+        "6) No intentes acceder fuera de los directorios permitidos.\n"
+        "Ejemplos:\n"
+        "• “Crea README.md con 'Hola mundo' en docs y muéstrame su contenido”.\n"
+        "• “Lista los archivos de la raíz permitida”.\n"
+    )
+
+    music_part = (
+        "\n[Instrucciones para música / playlists]\n"
+        "Tools: add_song, list_playlists, get_playlist, export_playlist, clear_library.\n"
+        "- Usa add_song para añadir; si hay confirmación, presenta candidatos y espera selección.\n"
+        "- list_playlists / get_playlist para listar/consultar; export_playlist para XLSX.\n"
+        "- clear_library limpia la librería.\n"
+        "Ejemplos:\n"
+        "• “Añade 'Blinding Lights' de The Weeknd y dime a qué playlist fue”.\n"
+        "• “Enséñame la playlist Chill”.\n"
+    )
+
+    prompt = base
+    if is_fs: prompt += fs_part
+    if is_music: prompt += music_part
+    if not is_fs and not is_music:
+        prompt += "\nTools disponibles: " + ", ".join(sorted(names)) + ". Úsalas cuando convenga.\n"
+    return prompt
+
+# -------------------------------------------------------------------
 # Worker de chat LLM (hilo): LLM → tool_use → tools → tool_result → LLM
 # -------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
-    "Eres Setlist Architect Host. Tienes herramientas MCP para gestionar música: "
-    "add_song, list_playlists, get_playlist, export_playlist, clear_library. "
-    "Usa las tools cuando ayuden a cumplir la petición del usuario. "
-    "Sé conciso y, cuando corresponda, muestra datos útiles."
-)
-
 class LLMWorker(QThread):
-    done = Signal(str, list)   # assistant_text, assistant_blocks
+    done = Signal(str, list)            # assistant_text, assistant_blocks
     fail = Signal(str)
-    refresh_hint = Signal()    # para refrescar tabla tras tool calls
+    song_added = Signal(dict)           # emite dict con datos de la canción añadida
+    library_cleared = Signal()          # emite cuando se limpia la librería
 
     def __init__(self, client: Anthropic, model: str, history: list[dict], user_text: str, mcp: MCPAdapter):
         super().__init__()
@@ -131,18 +202,21 @@ class LLMWorker(QThread):
             name = u["name"]; args = u["arguments"]; tu_id = u["id"]
             try:
                 result_obj = self.mcp.call_tool(name, args or {})
-                # si add_song pidió confirmación (flujo especial)
-                if isinstance(result_obj, dict) and result_obj.get("status") == "needs_confirmation":
-                    # devolvemos tal cual para que el LLM pida confirmación textual al usuario
-                    payload = json.dumps(result_obj, ensure_ascii=False)
-                else:
-                    payload = json.dumps(result_obj, ensure_ascii=False)
+                payload = json.dumps(result_obj, ensure_ascii=False)
+
+                # Señales específicas para GUI (música)
+                if name == "add_song":
+                    if isinstance(result_obj, dict) and "chosen" in result_obj and isinstance(result_obj["chosen"], dict):
+                        self.song_added.emit(result_obj["chosen"])
+                elif name == "clear_library":
+                    self.library_cleared.emit()
+
                 results_blocks.append({
                     "type": "tool_result",
                     "tool_use_id": tu_id,
-                    "content": payload
+                    "content": [{"type": "text", "text": payload}]
                 })
-            except MCPNeedsConfirmation as cf:  # por si usaste wrappers directamente
+            except MCPNeedsConfirmation as cf:
                 payload = json.dumps({
                     "status": "needs_confirmation",
                     "candidates": cf.candidates,
@@ -151,23 +225,27 @@ class LLMWorker(QThread):
                 results_blocks.append({
                     "type": "tool_result",
                     "tool_use_id": tu_id,
-                    "content": payload
+                    "content": [{"type": "text", "text": payload}]
                 })
             except Exception as e:
                 err = json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
-                results_blocks.append({"type":"tool_result","tool_use_id":tu_id,"content": err})
-        # Si ejecutamos tools que alteran estado, pide refrescar tabla
-        if any(u["name"] in ("add_song","clear_library") for u in uses):
-            self.refresh_hint.emit()
+                results_blocks.append({
+                    "type":"tool_result",
+                    "tool_use_id":tu_id,
+                    "content": [{"type": "text", "text": err}]
+                })
         return results_blocks
 
     def run(self):
         try:
-            tools_schema = GET_TOOLS()  # dinámico (llama tools/list al MCP o usa fallback)
+            # ✅ Tools normalizados (input_schema.type) desde el adapter
+            tools_schema = self.mcp.get_tools_schema(ttl_sec=10.0)
+            system_prompt = _build_system_prompt_for_tools(tools_schema)
+
             # Ronda 1
             msg1 = self.client.messages.create(
                 model=self.model,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 tools=tools_schema,
                 max_tokens=1024,
                 messages=self.history + [{"role":"user","content": self.user_text}],
@@ -182,7 +260,7 @@ class LLMWorker(QThread):
             tool_results = self._call_tools(uses)
             msg2 = self.client.messages.create(
                 model=self.model,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 tools=tools_schema,
                 max_tokens=1024,
                 messages=self.history
@@ -192,11 +270,11 @@ class LLMWorker(QThread):
             )
             uses2 = _extract_tool_uses(msg2.content)
             if uses2:
-                # (loop simple 2ª vuelta por si el modelo encadena otra tool)
+                # (segunda vuelta si encadena otra tool)
                 tool_results2 = self._call_tools(uses2)
                 msg3 = self.client.messages.create(
                     model=self.model,
-                    system=SYSTEM_PROMPT,
+                    system=system_prompt,
                     tools=tools_schema,
                     max_tokens=1024,
                     messages=self.history
@@ -243,12 +321,12 @@ class MainWindow(QMainWindow):
         self.history: List[Dict[str, Any]] = []
         self._last_user_text = ""
 
+        # Solo canciones agregadas EN ESTA SESIÓN (si está el server de música)
+        self._session_songs: List[Dict[str, Any]] = []
+
         self._build_ui()
         self._thinking_timer: Optional[QTimer] = None
         self._thinking_dots: int = 0
-
-        self._refresh_playlists()
-        self._refresh_library_table()
 
     # ---------------- UI ----------------
 
@@ -263,7 +341,7 @@ class MainWindow(QMainWindow):
         # --- Panel Chat (izquierda) ---
         self.chat_view = QTextEdit(); self.chat_view.setReadOnly(True)
         self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText('Habla natural: "añade Blinding Lights de The Weeknd y muéstrame las playlists"...')
+        self.input_edit.setPlaceholderText('Pide cosas naturales: "crea README en docs y muéstrame su contenido" • "añade Blinding Lights"...')
         self.input_edit.returnPressed.connect(self.on_send)
         self.send_btn = QPushButton("Enviar"); self.send_btn.clicked.connect(self.on_send)
         self.thinking_label = QLabel(""); self.thinking_label.setStyleSheet("color:#777;")
@@ -275,27 +353,16 @@ class MainWindow(QMainWindow):
         chat_box.addWidget(self.thinking_label)
         chat_panel = QWidget(); chat_panel.setLayout(chat_box)
 
-        # --- Panel derecho: filtros + referencia + tabla ---
+        # --- Panel derecho: referencia + tabla (solo música) ---
         right_box = QVBoxLayout()
 
-        # Fila de controles (solo filtro + refrescar)
-        ctrl_row = QHBoxLayout()
-        self.playlist_filter = QComboBox(); self.playlist_filter.addItem("Todas")
-        self.playlist_filter.currentIndexChanged.connect(self._refresh_library_table)
-        self.btn_refresh = QPushButton("Refrescar"); self.btn_refresh.clicked.connect(self._refresh_all)
-        ctrl_row.addWidget(QLabel("Playlist:")); ctrl_row.addWidget(self.playlist_filter, 1)
-        ctrl_row.addStretch(1); ctrl_row.addWidget(self.btn_refresh)
-        right_box.addLayout(ctrl_row)
-
-        # Referencia de funciones (para prompts)
-        self.ref_text = QTextEdit(); self.ref_text.setReadOnly(True); self.ref_text.setMaximumHeight(200)
+        self.ref_text = QTextEdit(); self.ref_text.setReadOnly(True); self.ref_text.setMaximumHeight(180)
         self.ref_text.setPlainText(self._build_reference_text())
-        right_box.addWidget(QLabel("Referencia de funciones MCP (para guiar tus prompts)"))
+        right_box.addWidget(QLabel("Referencia rápida"))
         right_box.addWidget(self.ref_text)
 
-        # Tabla principal
-        self.table = QTableWidget(0, 9)
-        self.table.setHorizontalHeaderLabels(["Título","Artistas","BPM","Key","Mode","Energy","Brightness","Duración (s)","Playlist"])
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(["Título","Artistas","BPM","Key","Mode","Energy","Brightness","Duración (s)"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -305,7 +372,6 @@ class MainWindow(QMainWindow):
 
         right_panel = QWidget(); right_panel.setLayout(right_box)
 
-        # Splitter
         splitter = QSplitter(Qt.Horizontal); splitter.addWidget(chat_panel); splitter.addWidget(right_panel)
         splitter.setSizes([520, 680])
 
@@ -314,22 +380,16 @@ class MainWindow(QMainWindow):
 
     def _build_reference_text(self) -> str:
         return (
-            "Pídele al asistente cosas como:\n"
-            "• “Añade ‘Blinding Lights’ de The Weeknd y dime en qué playlist cayó.”\n"
+            "Filesystem (ejemplos):\n"
+            "• “Crea README.md con 'Hola mundo' en la carpeta docs y muéstrame su contenido”.\n"
+            "• “Lista los archivos de la raíz permitida”.\n"
+            "• “Edita README.md: reemplaza 'Hola' por 'Hola 👋' y enséñame el diff”.\n"
+            "\n"
+            "Música (ejemplos):\n"
+            "• “Añade ‘Blinding Lights’ de The Weeknd.”\n"
             "• “Lista las playlists y cuántas canciones tienen.”\n"
-            "• “Enséñame la playlist Workout y exporta la Chill.”\n"
+            "• “Enséñame la playlist Chill.”\n"
             "• “Limpia la librería.”\n"
-            "\n"
-            "Herramientas disponibles (nombres exactos):\n"
-            "• add_song  → args: {title: str, artists?: str}\n"
-            "• list_playlists → args: {}\n"
-            "• get_playlist  → args: {name: str}\n"
-            "• export_playlist → args: {name: str} (genera .xlsx y devuelve file://...)\n"
-            "• clear_library → args: {}\n"
-            "\n"
-            "Notas:\n"
-            "• El asistente decide cuándo llamar a cada tool.\n"
-            "• El workspace se inyecta automáticamente desde el host.\n"
         )
 
     # ---------------- Utilidades de UI ----------------
@@ -354,63 +414,26 @@ class MainWindow(QMainWindow):
             self._thinking_timer.stop()
         self.thinking_label.setText(""); self.send_btn.setEnabled(True); self.input_edit.setEnabled(True)
 
-    # ---------------- Acciones de alto nivel ----------------
+    # ---------------- Tabla (solo música) ----------------
 
-    def _refresh_all(self):
-        self._refresh_playlists()
-        self._refresh_library_table()
-
-    def _refresh_playlists(self):
-        try:
-            pls = self.mcp.list_playlists()
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"No se pudo listar playlists:\n{e}")
-            return
-        current = self.playlist_filter.currentText() if self.playlist_filter.count() else "Todas"
-        self.playlist_filter.blockSignals(True)
-        self.playlist_filter.clear(); self.playlist_filter.addItem("Todas")
-        for p in sorted(pls, key=lambda x: x["name"].lower()):
-            self.playlist_filter.addItem(p["name"])
-        idx = self.playlist_filter.findText(current)
-        self.playlist_filter.setCurrentIndex(idx if idx >= 0 else 0)
-        self.playlist_filter.blockSignals(False)
-
-    def _collect_all_songs(self) -> List[Dict[str, Any]]:
-        songs_by_id: Dict[str, Dict[str, Any]] = {}
-        pls = self.mcp.list_playlists()
-        for p in pls:
-            name = p["name"]
-            data = self.mcp.get_playlist(name)
-            for s in data.get("songs", []):
-                sid = str(s.get("song_id"))
-                if sid not in songs_by_id:
-                    sc = dict(s); sc["playlist"] = name
-                    songs_by_id[sid] = sc
-        return list(songs_by_id.values())
-
-    def _refresh_library_table(self):
-        try:
-            songs = self._collect_all_songs()
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"No se pudo leer la librería:\n{e}")
-            return
-
-        flt = self.playlist_filter.currentText()
-        if flt and flt != "Todas":
-            songs = [s for s in songs if s.get("playlist") == flt]
-
+    def _table_clear_session(self):
+        self._session_songs.clear()
         self.table.setRowCount(0)
-        for s in songs:
-            r = self.table.rowCount(); self.table.insertRow(r)
-            self.table.setItem(r, 0, QTableWidgetItem(str(s.get("title", ""))))
-            self.table.setItem(r, 1, QTableWidgetItem(str(s.get("artists", ""))))
-            self.table.setItem(r, 2, QTableWidgetItem(_fmt_num(s.get("bpm"), 2)))
-            self.table.setItem(r, 3, QTableWidgetItem(str(s.get("key", ""))))
-            self.table.setItem(r, 4, QTableWidgetItem(str(s.get("mode", ""))))
-            self.table.setItem(r, 5, QTableWidgetItem(_fmt_num(s.get("energy"), 3)))
-            self.table.setItem(r, 6, QTableWidgetItem(_fmt_num(s.get("brightness"), 3)))
-            self.table.setItem(r, 7, QTableWidgetItem(_fmt_num(s.get("duration_sec"), 1)))
-            self.table.setItem(r, 8, QTableWidgetItem(str(s.get("playlist", ""))))
+
+    def _table_add_song(self, song: Dict[str, Any]):
+        self._session_songs.append(song)
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+
+        def s(k, default=""): return str(song.get(k, default) if song.get(k, default) is not None else "")
+        self.table.setItem(r, 0, QTableWidgetItem(s("title")))
+        self.table.setItem(r, 1, QTableWidgetItem(s("artists")))
+        self.table.setItem(r, 2, QTableWidgetItem(_fmt_num(song.get("bpm"), 2)))
+        self.table.setItem(r, 3, QTableWidgetItem(s("key")))
+        self.table.setItem(r, 4, QTableWidgetItem(s("mode")))
+        self.table.setItem(r, 5, QTableWidgetItem(_fmt_num(song.get("energy"), 3)))
+        self.table.setItem(r, 6, QTableWidgetItem(_fmt_num(song.get("brightness"), 3)))
+        self.table.setItem(r, 7, QTableWidgetItem(_fmt_num(song.get("duration_sec"), 1)))
         self.table.resizeRowsToContents()
 
     # ---------------- Chat (LLM) ----------------
@@ -426,24 +449,29 @@ class MainWindow(QMainWindow):
         worker = LLMWorker(self.client, self.model, self.history, text, self.mcp)
         worker.done.connect(self._on_llm_done)
         worker.fail.connect(self._on_llm_fail)
-        worker.refresh_hint.connect(self._refresh_all)
+        worker.song_added.connect(self._on_song_added)
+        worker.library_cleared.connect(self._on_library_cleared)
         worker.start()
-        self._llm_worker = worker
+        self._llm_worker = worker  # evita GC del thread
 
     def _on_llm_done(self, assistant_text: str, blocks: list):
         self._thinking_stop()
         self.append_chat("assistant", assistant_text or "(sin texto)")
-        # Actualizar history (preserva bloques originales)
+        # Actualizar history con bloques normalizados
         self.history.extend([
             {"role": "user", "content": self._last_user_text},
-            {"role": "assistant", "content": blocks},
+            {"role": "assistant", "content": _normalize_blocks(blocks)},
         ])
-        # refrescar por si el modelo pidió listados
-        self._refresh_all()
 
     def _on_llm_fail(self, err: str):
         self._thinking_stop()
         self.append_chat("assistant", f"[ERROR]\n<pre>{err}</pre>")
+
+    def _on_song_added(self, chosen: dict):
+        self._table_add_song(chosen)
+
+    def _on_library_cleared(self):
+        self._table_clear_session()
 
 # -------------------------------------------------------------------
 # Entry point

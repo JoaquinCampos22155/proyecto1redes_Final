@@ -1,5 +1,13 @@
 # claves y configs locales
 .env
+*/.env 
+*/.env.*
+**/.env       
+**/.env.*
+mcp-console-host/profiles/filesystem.env
+mcp-console-host/profiles/github.env
+mcp-console-host/profiles/local_setlist.env
+
 __pycache__/
 .venv/
 venv/
