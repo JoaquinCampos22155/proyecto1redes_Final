@@ -3,10 +3,10 @@
 MCP Adapter (fachada de alto nivel para el host/chatbot).
 
 - Descubre tools en runtime (con caché).
-- Inyecta 'workspace' solo cuando la tool lo declara o si está whitelisteada (setlist).
+- Inyecta 'workspace' automáticamente SOLO si la tool lo acepta.
+- Para el server de música (setlist), inyecta 'workspace' siempre (fallback seguro).
 - Normaliza errores del servidor MCP.
-- Wrappers convenientes para las tools de setlist (add_song, list_playlists, etc.).
-- Listo para conectar a una GUI/LLM.
+- Wrappers convenientes para las tools conocidas (add_song, list_playlists, etc.).
 
 Dependencias internas:
   - host.mcp_client.MCPClient
@@ -21,16 +21,13 @@ import time
 from host.mcp_client import MCPClient
 from host.settings import DEFAULT_WORKSPACE
 
-
 # --------- Errores de alto nivel ---------
 
 class MCPAdapterError(Exception):
     """Error genérico del adapter."""
 
-
 class MCPServerError(MCPAdapterError):
     """El MCP devolvió un error JSON-RPC (top-level)."""
-
 
 class MCPNeedsConfirmation(MCPAdapterError):
     """
@@ -68,12 +65,10 @@ class CandidateView:
             preview_url=(c.get("preview_url") if c.get("preview_url") else None),
         )
 
-
 @dataclass
 class AddSongOK:
     status: str            # "ok"
     chosen: Dict[str, Any] # incluye playlist asignada
-
 
 @dataclass
 class AddSongConfirmation:
@@ -87,15 +82,22 @@ class AddSongConfirmation:
 class MCPAdapter:
     """
     Fachada sobre MCPClient con:
-    - get_tools_schema() con caché
-    - call_tool() con inyección condicional de workspace
-    - helpers de alto nivel para cada tool de setlist
+    - get_tools_schema() con caché y normalización a snake_case esperado por LLMs
+    - call_tool() inyectando workspace solo cuando procede
+    - helpers de alto nivel para cada tool
     """
     def __init__(self, workspace: Optional[str] = None):
         self.workspace = (workspace or DEFAULT_WORKSPACE)
         self._client = MCPClient()
         self._client.start()
         self._tools_cache: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
+        # Mapa: name -> bool indicando si el schema DECLARA 'workspace'
+        self._tools_accept_workspace: Dict[str, bool] = {}
+
+        # Fallback seguro para el servidor de música por si no declara 'workspace'
+        self._always_inject_ws = {
+            "add_song", "list_playlists", "get_playlist", "export_playlist", "clear_library"
+        }
 
     # ---- Infra ----
     def set_workspace(self, ws: str) -> None:
@@ -110,12 +112,52 @@ class MCPAdapter:
         except Exception:
             pass
 
+    # ---- Normalización de tools ----
+    def _normalize_tool_schema(self, t: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convierte una tool del formato del server (a menudo 'inputSchema') al formato
+        esperado por Anthropic/OpenAI ('input_schema'), asegurando:
+        - type: "object"
+        - properties: {}
+        NO añade 'workspace' si el server no lo declara (para evitar 400 en servers como filesystem).
+        """
+        name = str(t.get("name") or "")
+        desc = str(t.get("description") or "")
+
+        # Algunos servers devuelven 'inputSchema' en camelCase
+        schema = t.get("input_schema")
+        if not isinstance(schema, dict):
+            schema = t.get("inputSchema", {}) or {}
+        if not isinstance(schema, dict):
+            schema = {}
+
+        # Asegurar forma básica de JSON Schema
+        if "type" not in schema or not isinstance(schema.get("type"), str):
+            schema["type"] = "object"
+        props = schema.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+            schema["properties"] = props
+
+        # ¿Declara workspace?
+        accepts_ws = "workspace" in props
+
+        # Si lo declara, aseguramos metadatos mínimos
+        if accepts_ws and isinstance(props.get("workspace"), dict):
+            props["workspace"].setdefault("type", "string")
+            props["workspace"].setdefault("description", "Workspace/session id")
+
+        # Guardamos si acepta workspace de verdad
+        self._tools_accept_workspace[name] = accepts_ws
+
+        return {
+            "name": name,
+            "description": desc,
+            "input_schema": schema,
+        }
+
     # ---- Tools schema (descubrimiento con caché) ----
     def get_tools_schema(self, *, ttl_sec: float = 60.0) -> List[Dict[str, Any]]:
-        """
-        Devuelve la lista de tools tal como las reporta el servidor (sin mutarlas).
-        Estructura esperada (MCP): result.tools[].{name, description, inputSchema|input_schema}
-        """
         ts, cached = self._tools_cache
         now = time.time()
         if cached and (now - ts) < ttl_sec:
@@ -124,77 +166,29 @@ class MCPAdapter:
         resp = self._client.tools_list()
         if "error" in resp:
             raise MCPServerError(str(resp["error"]))
-        tools = list(resp.get("result", {}).get("tools", []))
+
+        raw_tools = list(resp.get("result", {}).get("tools", []))
+        tools: List[Dict[str, Any]] = []
+        self._tools_accept_workspace.clear()
+
+        for t in raw_tools:
+            norm = self._normalize_tool_schema(t)
+            tools.append(norm)
+
+        # Cache
         self._tools_cache = (now, tools)
         return tools
 
-    # ---- Utilidades internas ----
-    def _find_tool_schema(self, tool_name: str) -> Optional[Dict[str, Any]]:
-        try:
-            for t in self.get_tools_schema():
-                if t.get("name") == tool_name:
-                    return t
-        except Exception:
-            return None
-        return None
-
-    def _input_schema_dict(self, tool_obj: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Devuelve el objeto schema de entrada indiferente a snake/camel:
-        - 'input_schema' (snake) o 'inputSchema' (camel)
-        """
-        if not isinstance(tool_obj, dict):
-            return {}
-        schema = tool_obj.get("input_schema")
-        if isinstance(schema, dict):
-            return schema
-        schema = tool_obj.get("inputSchema")
-        if isinstance(schema, dict):
-            return schema
-        return {}
-
-    def _tool_accepts_workspace(self, tool_name: str) -> bool:
-        """
-        True si el JSON Schema declara la propiedad 'workspace'.
-        """
-        tool = self._find_tool_schema(tool_name)
-        if not tool:
-            return False
-        schema = self._input_schema_dict(tool)
-        props = schema.get("properties") or {}
-        return "workspace" in props
-
-    def _always_workspace_tools(self) -> set[str]:
-        """
-        Whitelist para tu servidor local 'setlist-architect-mcp', por
-        compatibilidad si el schema no declara 'workspace'.
-        """
-        return {
-            "add_song",
-            "list_playlists",
-            "get_playlist",
-            "export_playlist",
-            "clear_library",
-        }
-
     # ---- Llamada genérica ----
-    def call_tool(
-        self,
-        name: str,
-        args: Optional[Dict[str, Any]] = None,
-        *,
-        workspace: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Llama tools/call con inyección condicional de 'workspace':
-        - Se inyecta si la tool lo declara en su schema (propiedad 'workspace'), o
-        - si el nombre está en el whitelist de setlist.
-        """
+    def call_tool(self, name: str, args: Optional[Dict[str, Any]] = None, *, workspace: Optional[str] = None) -> Dict[str, Any]:
         arguments = dict(args or {})
 
-        should_inject = self._tool_accepts_workspace(name) or (name in self._always_workspace_tools())
-        if should_inject:
-            arguments.setdefault("workspace", workspace or self.workspace)
+        # Inyectar workspace solo si:
+        #   a) la tool lo declara en su schema, o
+        #   b) está en la lista de fallback del server de música.
+        accept_ws = self._tools_accept_workspace.get(name, False)
+        if (accept_ws or name in self._always_inject_ws) and "workspace" not in arguments:
+            arguments["workspace"] = workspace or self.workspace
 
         resp = self._client.tools_call(name, arguments)
         if "error" in resp:
@@ -204,6 +198,7 @@ class MCPAdapter:
 
     # ---- Wrappers de alto nivel (setlist) ----
 
+    # add_song con manejo de needs_confirmation
     def add_song(
         self,
         title: str,
@@ -229,7 +224,6 @@ class MCPAdapter:
         if status == "needs_confirmation":
             candidates = [CandidateView.from_raw(c) for c in (result.get("candidates") or [])]
             msg = str(result.get("message") or "Se requiere confirmación del candidato.")
-            # Proveer a la GUI/LLM el contexto para relanzar con candidate_index/id
             original = dict(args)
             raise MCPNeedsConfirmation([c.__dict__ for c in candidates], msg, original)
 
@@ -256,7 +250,7 @@ class MCPAdapter:
     # ---- Utilidad: transformar schema para un LLM (opcional) ----
     def as_llm_tools(self) -> List[Dict[str, Any]]:
         """
-        Devuelve las tools descubiertas tal cual (JSON Schema), listas para
-        registrarse en un LLM que soporte "tools" con JSON Schema.
+        Devuelve las tools descubiertas tal cual (JSON Schema normalizado a 'input_schema'),
+        listas para registrarse en un LLM que soporte "tools" con JSON Schema.
         """
         return self.get_tools_schema(ttl_sec=60.0)

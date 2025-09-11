@@ -144,17 +144,17 @@ def _build_system_prompt_for_tools(tools_schema: List[Dict[str, Any]]) -> str:
     base = (
         "Eres el Host MCP. Puedes llamar herramientas MCP cuando ayuden a cumplir la petición del usuario.\n"
         "- Devuelve respuestas claras y concisas.\n"
-        "- Cuando llames una tool, espera su resultado y resume lo hecho.\n"
+        "- Si llamas a una tool, espera su resultado y explica brevemente lo hecho.\n"
     )
 
     fs_part = (
         "\n[Instrucciones para sistema de archivos]\n"
-        "1) Llama primero a list_allowed_directories para conocer la(s) carpeta(s) permitida(s).\n"
+        "1) Llama primero a list_allowed_directories para obtener la(s) carpeta(s) permitida(s).\n"
         "2) Usa la PRIMERA ruta permitida como raíz por defecto.\n"
-        "3) Resuelve rutas relativas dentro de esa raíz (p. ej., raiz + '/docs/README.md').\n"
+        "3) Resuelve rutas relativas dentro de esa raíz (p.ej., raíz + '/docs/README.md').\n"
         "4) Si no existe la carpeta destino, crea la jerarquía con create_directory antes de escribir/mover.\n"
-        "5) Para crear/actualizar archivo: write_file. Para mostrar contenido: read_text_file.\n"
-        "6) No intentes acceder fuera de los directorios permitidos.\n"
+        "5) Para crear/actualizar un archivo: write_file. Para mostrar contenido: read_text_file.\n"
+        "6) Nunca intentes acceder fuera de los directorios permitidos.\n"
         "Ejemplos:\n"
         "• “Crea README.md con 'Hola mundo' en docs y muéstrame su contenido”.\n"
         "• “Lista los archivos de la raíz permitida”.\n"
@@ -162,9 +162,9 @@ def _build_system_prompt_for_tools(tools_schema: List[Dict[str, Any]]) -> str:
 
     music_part = (
         "\n[Instrucciones para música / playlists]\n"
-        "Tools: add_song, list_playlists, get_playlist, export_playlist, clear_library.\n"
-        "- Usa add_song para añadir; si hay confirmación, presenta candidatos y espera selección.\n"
-        "- list_playlists / get_playlist para listar/consultar; export_playlist para XLSX.\n"
+        "Tienes tools: add_song, list_playlists, get_playlist, export_playlist, clear_library.\n"
+        "- Usa add_song para añadir; si hay confirmación, presenta candidatos.\n"
+        "- Usa list_playlists / get_playlist para listar/consultar; export_playlist para XLSX.\n"
         "- clear_library limpia la librería.\n"
         "Ejemplos:\n"
         "• “Añade 'Blinding Lights' de The Weeknd y dime a qué playlist fue”.\n"
@@ -183,7 +183,8 @@ def _build_system_prompt_for_tools(tools_schema: List[Dict[str, Any]]) -> str:
 # -------------------------------------------------------------------
 
 class LLMWorker(QThread):
-    done = Signal(str, list)            # assistant_text, assistant_blocks
+    # ✅ Incluimos el patch completo para guardarlo en history
+    done = Signal(str, list, list)      # assistant_text, assistant_blocks_final, patch_msgs
     fail = Signal(str)
     song_added = Signal(dict)           # emite dict con datos de la canción añadida
     library_cleared = Signal()          # emite cuando se limpia la librería
@@ -238,58 +239,48 @@ class LLMWorker(QThread):
 
     def run(self):
         try:
-            # ✅ Tools normalizados (input_schema.type) desde el adapter
             tools_schema = self.mcp.get_tools_schema(ttl_sec=10.0)
             system_prompt = _build_system_prompt_for_tools(tools_schema)
 
-            # Ronda 1
-            msg1 = self.client.messages.create(
-                model=self.model,
-                system=system_prompt,
-                tools=tools_schema,
-                max_tokens=1024,
-                messages=self.history + [{"role":"user","content": self.user_text}],
-            )
-            uses = _extract_tool_uses(msg1.content)
-            if not uses:
-                text = _blocks_to_text(msg1.content)
-                self.done.emit(text, msg1.content)
-                return
+            patch: List[Dict[str, Any]] = []
+            patch.append({"role": "user", "content": self.user_text})
 
-            # Ejecutar tools y seguir
-            tool_results = self._call_tools(uses)
-            msg2 = self.client.messages.create(
-                model=self.model,
-                system=system_prompt,
-                tools=tools_schema,
-                max_tokens=1024,
-                messages=self.history
-                    + [{"role":"user","content": self.user_text}]
-                    + [{"role":"assistant","content": msg1.content}]
-                    + [{"role":"user","content": tool_results}],
-            )
-            uses2 = _extract_tool_uses(msg2.content)
-            if uses2:
-                # (segunda vuelta si encadena otra tool)
-                tool_results2 = self._call_tools(uses2)
-                msg3 = self.client.messages.create(
+            final_blocks = []
+            final_text = ""
+            MAX_TOOL_HOPS = 8  # seguridad: admite cadenas largas (FS suele necesitar varias)
+
+            for _ in range(MAX_TOOL_HOPS):
+                # 1) Modelo razona y (opcionalmente) pide tools
+                msg = self.client.messages.create(
                     model=self.model,
                     system=system_prompt,
                     tools=tools_schema,
                     max_tokens=1024,
-                    messages=self.history
-                        + [{"role":"user","content": self.user_text}]
-                        + [{"role":"assistant","content": msg1.content}]
-                        + [{"role":"user","content": tool_results}]
-                        + [{"role":"assistant","content": msg2.content}]
-                        + [{"role":"user","content": tool_results2}],
+                    messages=self.history + patch
                 )
-                text = _blocks_to_text(msg3.content)
-                self.done.emit(text, msg3.content)
-                return
+                patch.append({"role": "assistant", "content": msg.content})
 
-            text = _blocks_to_text(msg2.content)
-            self.done.emit(text, msg2.content)
+                uses = _extract_tool_uses(msg.content)
+                if not uses:
+                    final_blocks = msg.content
+                    final_text = _blocks_to_text(msg.content)
+                    break
+
+                # 2) Ejecutamos todas las tools pedidas y entregamos resultados
+                tool_results = self._call_tools(uses)
+
+                # ¡IMPORTANTE!: el siguiente mensaje DEBE ser user con SOLO tool_result
+                patch.append({"role": "user", "content": tool_results})
+
+            else:
+                # Salimos por límite de hops: dejamos la conversación en estado válido
+                # (el último assistant(tool_use) ya recibió su user(tool_result))
+                # No hay respuesta final del modelo; mostramos algo corto.
+                final_blocks = patch[-1]["content"] if patch and patch[-1]["role"] == "assistant" else []
+                if not final_text:
+                    final_text = "Hecho. (Se alcanzó el límite de pasos de herramientas; si necesitas, di “sigue”)."
+
+            self.done.emit(final_text, final_blocks, patch)
 
         except Exception as e:
             self.fail.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -341,7 +332,7 @@ class MainWindow(QMainWindow):
         # --- Panel Chat (izquierda) ---
         self.chat_view = QTextEdit(); self.chat_view.setReadOnly(True)
         self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText('Pide cosas naturales: "crea README en docs y muéstrame su contenido" • "añade Blinding Lights"...')
+        self.input_edit.setPlaceholderText('Pide cosas naturales: ej. "crea README en docs y muéstrame su contenido" • "añade Blinding Lights"...')
         self.input_edit.returnPressed.connect(self.on_send)
         self.send_btn = QPushButton("Enviar"); self.send_btn.clicked.connect(self.on_send)
         self.thinking_label = QLabel(""); self.thinking_label.setStyleSheet("color:#777;")
@@ -454,14 +445,20 @@ class MainWindow(QMainWindow):
         worker.start()
         self._llm_worker = worker  # evita GC del thread
 
-    def _on_llm_done(self, assistant_text: str, blocks: list):
+    def _on_llm_done(self, assistant_text: str, blocks_final: list, patch: List[Dict[str, Any]]):
         self._thinking_stop()
         self.append_chat("assistant", assistant_text or "(sin texto)")
-        # Actualizar history con bloques normalizados
-        self.history.extend([
-            {"role": "user", "content": self._last_user_text},
-            {"role": "assistant", "content": _normalize_blocks(blocks)},
-        ])
+        # ✅ Guardar TODO el patch de mensajes (incluye tool_result intermedios)
+        #    Esto evita `tool_use` huérfanos en el siguiente turno.
+        #    Además, normalizamos los bloques assistant para que queden “serializables”.
+        patched_history: List[Dict[str, Any]] = []
+        for msg in patch:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role == "assistant":
+                content = _normalize_blocks(content)
+            patched_history.append({"role": role, "content": content})
+        self.history.extend(patched_history)
 
     def _on_llm_fail(self, err: str):
         self._thinking_stop()

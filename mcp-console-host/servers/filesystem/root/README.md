@@ -1,1 +1,0 @@
-Hola MCP estamos en la prueba de clase
