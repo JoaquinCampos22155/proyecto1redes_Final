@@ -11,3 +11,6 @@ mcp-console-host/profiles/local_setlist.env
 __pycache__/
 .venv/
 venv/
+
+mcp-console-host/profiles/remote.env
+
