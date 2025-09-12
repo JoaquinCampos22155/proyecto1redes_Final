@@ -11,6 +11,9 @@ Variables de entorno principales (opcional):
                         "C:/ruta/python.exe C:/ruta/setlist-architect-mcp/server.py"
   MCP_SERVER_PY        Ruta al intérprete Python a usar con server.py (si prefieres separar).
   MCP_SERVER_PATH      Ruta al server.py del MCP (si no usas MCP_SERVER_CMD).
+  MCP_SERVER_URL       URL de un servidor MCP remoto por SSE (p.ej. https://.../sse).
+  MCP_SERVER_TRANSPORT Tipo de transporte: "sse" (si hay URL) o "stdio" (local). Por defecto
+                        se asume "sse" si MCP_SERVER_URL está definido; en caso contrario "stdio".
   MCP_WORKSPACE        ID de workspace por defecto.
   MCP_REQ_TIMEOUT_SEC  Timeout de petición (host esperando respuesta), por defecto 30.
   MCP_STARTUP_TIMEOUT  Timeout para que el proceso inicie, por defecto 8.
@@ -46,7 +49,7 @@ def _slug(s: str) -> str:
     import re
     s = (s or "").strip()
     s = re.sub(r"\s+", "-", s)
-    s = re.sub(r"[^A-Za-z0-9._\-]", "_", s)
+    s = re.sub(r"[^A-Za-z0-9._\\-]", "_", s)
     return s[:64] or "default"
 
 def _detect_repo_name() -> str:
@@ -88,7 +91,14 @@ try:
 except Exception:
     pass
 
-# --- Resolución del comando para el servidor MCP ---
+# --- Config remoto opcional ---
+MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL")  # p.ej. https://.../sse
+MCP_SERVER_TRANSPORT = os.environ.get(
+    "MCP_SERVER_TRANSPORT",
+    "sse" if MCP_SERVER_URL else "stdio",
+).lower()
+
+# --- Resolución del comando para el servidor MCP (solo si local/stdio) ---
 # Prioridad:
 #  1) MCP_SERVER_CMD (cadena completa)
 #  2) MCP_SERVER_PY + MCP_SERVER_PATH
@@ -127,7 +137,11 @@ MCP_SERVER_CMD = _build_server_cmd()
 def print_startup_banner():
     if _env_bool("MCP_BANNER", True):
         print("[host] MCP settings:")
-        print(f"  - MCP_SERVER_CMD     : {MCP_SERVER_CMD}")
+        if MCP_SERVER_URL:
+            print(f"  - MCP_SERVER_URL     : {MCP_SERVER_URL}")
+            print(f"  - MCP_TRANSPORT      : {MCP_SERVER_TRANSPORT}")
+        else:
+            print(f"  - MCP_SERVER_CMD     : {MCP_SERVER_CMD}")
         print(f"  - DEFAULT_WORKSPACE  : {DEFAULT_WORKSPACE}")
         print(f"  - REQUEST_TIMEOUT_SEC: {REQUEST_TIMEOUT_SEC}")
         print(f"  - STARTUP_TIMEOUT_SEC: {STARTUP_TIMEOUT_SEC}")

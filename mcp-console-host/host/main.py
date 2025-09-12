@@ -13,7 +13,7 @@ from host.settings import (
     print_startup_banner,
 )
 from host.mcp_adapter import MCPAdapter, MCPNeedsConfirmation, MCPServerError, MCPAdapterError
-from host.tool_schemas import TOOLS as GET_TOOLS  # schemas dinámicos (con fallback)
+from host.tool_schemas import TOOLS as GET_TOOLS  
 
 # ------------------------------------------------------------------------------
 # Utilidades comunes
@@ -289,6 +289,8 @@ SYSTEM_PROMPT = (
     "add_song, list_playlists, get_playlist, export_playlist, clear_library. "
     "Usa las tools cuando ayuden a cumplir la petición del usuario. "
     "Sé conciso y, cuando corresponda, muestra datos útiles."
+    "Eres un asistente CLI con herramientas MCP dinámicas. "
+    "Usa las tools disponibles cuando ayuden a cumplir la petición del usuario. Sé conciso."
 )
 
 CHAT_HELP = """Comandos dentro de chat:
@@ -349,9 +351,9 @@ def cmd_chat(args) -> int:
     chat_log = f"logs/cli-{int(time.time())}.chat.jsonl"
 
     # Tools schema (puede ser dict o lista)
-    schema = GET_TOOLS()
-    tools = schema["tools"] if isinstance(schema, dict) and "tools" in schema else schema
-    tools = tools or []
+    schema = {"tools": mcp.as_llm_tools()}
+    tools = schema["tools"]
+
 
     print(f"[chat] modelo={model} | workspace={args.ws}")
     print("Escribe /help para ver comandos.\n")

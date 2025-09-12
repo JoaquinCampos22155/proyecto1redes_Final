@@ -1,0 +1,7 @@
+{"t": "user", "ts": "2025-09-11 18:38:28", "content": "hola"}
+{"t": "assistant", "ts": "2025-09-11 18:38:31", "content": "¡Hola! Soy el Eres Setlist Architect Host (CLI). Estoy listo para ayudarte a gestionar tu música. ¿En qué puedo asistirte hoy? Puedo ayudarte con tareas como agregar canciones, listar listas de reproducción, obtener detalles de una lista, exportar listas, o limpiar la biblioteca. Solo tienes que decirme qué necesitas."}
+{"t": "user", "ts": "2025-09-11 18:42:25", "content": "echo este mensaje: \"holaaa todos\""}
+{"t": "tool_result", "ts": "2025-09-11 18:42:27", "tool": "echo", "args": {"text": "holaaa todos"}, "result": {"content": [{"type": "text", "text": "holaaa todos"}]}}
+{"t": "assistant", "ts": "2025-09-11 18:42:28", "content": ""}
+{"t": "user", "ts": "2025-09-11 18:42:39", "content": "sha este mensaje\"hola\""}
+{"t": "llm_error", "ts": "2025-09-11 18:42:39", "error": "BadRequestError: Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'messages.3: all messages must have non-empty content except for the optional final assistant message'}, 'request_id': 'req_011CT3aXC9djLGXEVn4R9zJK'}"}
